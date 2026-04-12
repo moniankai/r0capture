@@ -1,101 +1,283 @@
 # r0capture
 
-安卓应用层抓包通杀脚本
+安卓 SSL 通杀抓包脚本，扩展支持红果免费短剧的 CENC 加密视频一键下载。
 
-## 简介
+---
 
-- 仅限安卓平台，测试安卓7、8、9、10、11、12、13、14 、15、16可用 ；
-- 无视所有证书校验或绑定，不用考虑任何证书的事情；
-- 通杀TCP/IP四层模型中的应用层中的全部协议；
-- 通杀协议包括：Http,WebSocket,Ftp,Xmpp,Imap,Smtp,Protobuf等等、以及它们的SSL版本；
-- 通杀所有应用层框架，包括HttpUrlConnection、Okhttp1/3/4、Retrofit/Volley等等；
-- 无视加固，不管是整体壳还是二代壳或VMP，不用考虑加固的事情；
-- 如果有抓不到的情况欢迎提issue，或者直接加vx：r0ysue，进行反馈~
+## 目录
 
-### March.2026更新frida17支持 
-推荐搭配：frida17/安卓16     frida16.5.2/安卓14      frida15.2.2/安卓12
+- [红果短剧下载器](#红果短剧下载器)
+  - [环境准备](#环境准备)
+  - [操作流程](#操作流程)
+  - [使用示例](#使用示例)
+  - [参数说明](#参数说明)
+- [视频解密工具](#视频解密工具)
+- [LLM 预处理工具](#llm-预处理工具)
+- [r0capture 通用抓包](#r0capture-通用抓包)
 
-### June.18th 2023 update：测试Pixel4/安卓13/KernelSU/Frida16 功能工作正常 正常抓包 导出证书
+---
 
-### January.14th 2021 update：增加几个辅助功能
+## 红果短剧下载器
 
-- 增加App收发包函数定位功能
-- 增加App客户端证书导出功能
-- 新增host连接方式“-H”，用于Frida-server监听在非标准端口时的连接
+`scripts/download_drama.py` — 红果免费短剧一键下载工具。
 
-## 用法
+**工作原理：**
 
-- 推荐环境：[https://github.com/r0ysue/AndroidSecurityStudy/blob/master/FRIDA/A01/README.md](https://github.com/r0ysue/AndroidSecurityStudy/blob/master/FRIDA/A01/README.md)
+1. 启动 App 并注入 Frida 双 Hook（Java 层 TTVideoEngine URL + Native 层 av_aes_init 密钥）
+2. 自动捕获视频 CDN 地址与 AES-128 解密密钥
+3. 下载 CENC 加密 MP4，在本地完成 AES-CTR-128 解密
+4. 输出可直接播放的 MP4 文件（H.264 / H.265 编码）
 
-切记仅限安卓平台7、8、9、10、11 可用 ，禁止使用模拟器。
+### 环境准备
 
-- Spawn 模式：
+#### 1. Python 依赖
 
-`$ python3 r0capture.py -U -f com.coolapk.market -v`
-
-- Attach 模式，抓包内容保存成pcap文件供后续分析： 
-
-`$ python3 r0capture.py -U 酷安 -v -p iqiyi.pcap` 
-
-建议使用`Attach`模式，从感兴趣的地方开始抓包，并且保存成`pcap`文件，供后续使用Wireshark进行分析。
-> 老版本Frida使用包名，新版本Frida使用APP名。APP名必须是点开app后，frida-ps -U显示的那个app名字。
-
-![](pic/Sample.PNG)
-
-- 收发包函数定位：`Spawn`和`attach`模式均默认开启；
-
-> 可以使用`python r0capture.py -U -f cn.soulapp.android -v  >> soul3.txt`这样的命令将输出重定向至txt文件中稍后过滤内容
-
-![](pic/locator.png)
-
-- 客户端证书导出功能：默认开启；必须以Spawm模式运行；
-
-> 运行脚本之前必须手动给App加上存储卡读写权限；
-
-> 并不是所有App都部署了服务器验证客户端的机制，只有配置了的才会在Apk中包含客户端证书
-
-> 导出后的证书位于/sdcard/Download/包名xxx.p12路径，导出多次，每一份均可用，密码默认为：r0ysue，推荐使用[keystore-explorer](http://keystore-explorer.org/)打开查看证书。
-
-![](pic/clientcer.png)
-
-- 新增host连接方式“-H”，用于Frida-server监听在非标准端口时的连接。有些App会检测Frida标准端口，因此frida-server开在非标准端口可以绕过检测。
-
-![](pic/difport.png)
-
-## 感谢[爱吃菠菜](https://bbs.pediy.com/user-760871.htm)巨巨总结的本项目知识点
-
-![](pic/summary1.jpg)
-![](pic/summary2.jpg)
-
-
-PS：
-
-> 这个项目基于[frida_ssl_logger](https://github.com/BigFaceCat2017/frida_ssl_logger)，之所以换个名字，只是侧重点不同。 原项目的侧重点在于抓ssl和跨平台，本项目的侧重点是抓到所有的包。
-
-> 局限：部分开发实力过强的大厂或框架，采用的是自身的SSL框架，比如WebView、小程序或Flutter，这部分目前暂未支持。部分融合App本质上已经不属于安卓App，没有使用安卓系统的框架，无法支持。当然这部分App也是少数。暂不支持HTTP/2、或HTTP/3，该部分API在安卓系统上暂未普及或布署，为App自带，无法进行通用hook。各种模拟器架构、实现、环境较为复杂，建议珍爱生命、使用真机。暂未添加多进程支持，比如:service或:push等子进程，可以使用Frida的Child-gating来支持一下。支持多进程之后要考虑pcap文件的写入锁问题，可以用frida-tool的Reactor线程锁来支持一下。
-
-## 以下是原项目的简介：
-
-[https://github.com/BigFaceCat2017/frida_ssl_logger](https://github.com/BigFaceCat2017/frida_ssl_logger)
-
-### frida_ssl_logger
-ssl_logger based on frida
-for from https://github.com/google/ssl_logger
-
-### 修改内容
-1. 优化了frida的JS脚本，修复了在新版frida上的语法错误；
-2. 调整JS脚本，使其适配iOS和macOS，同时也兼容了Android；
-3. 增加了更多的选项，使其能在多种情况下使用；
-
-### 安装依赖
+```bash
+pip install -r requirements.txt
+pip install imageio-ffmpeg   # 可选，用于 --preprocess
+pip install faster-whisper   # 可选，用于 --preprocess
 ```
-Python版本>=3.6
-pip install loguru
-pip install click
-```
-### Usage
-  ```shell
-    python3 ./ssl_logger.py  -U -f com.bfc.mm
-    python3 ./ssl_logger.py -v  -p test.pcap  6666
-  ````
 
+#### 2. Android 设备
+
+| 要求 | 说明 |
+| ---- | ---- |
+| Root 权限 | Magisk / KernelSU |
+| USB 调试 | 设置 → 开发者选项 → USB 调试 |
+| Frida Server | 版本需与 PC 端 frida 包匹配，推荐 frida 16.5.9（兼容 Android 9+） |
+| 红果 App | com.phoenix.read，版本无要求 |
+
+**启动 Frida Server（每次重启手机后执行）：**
+
+```bash
+adb shell su -c "/data/local/tmp/frida-server &"
+```
+
+#### 3. ADBKeyboard（仅 --search 模式需要）
+
+用于通过 ADB 向手机输入中文剧名，一次性安装：
+
+```bash
+# 自动安装（需 root）
+MSYS_NO_PATHCONV=1 adb push ADBKeyboard.apk /data/local/tmp/ADBKeyboard.apk
+MSYS_NO_PATHCONV=1 adb shell su -c "pm install /data/local/tmp/ADBKeyboard.apk"
+MSYS_NO_PATHCONV=1 adb shell ime enable com.android.adbkeyboard/.AdbIME
+MSYS_NO_PATHCONV=1 adb shell ime set com.android.adbkeyboard/.AdbIME
+```
+
+> APK 下载：[github.com/senzhk/ADBKeyBoard/releases](https://github.com/senzhk/ADBKeyBoard/releases)
+
+---
+
+### 操作流程
+
+#### 模式 A：手动模式（无需 ADBKeyboard）
+
+```
+PC                              手机
+─────────────────────────────────────────────────────
+1. 运行脚本 (--name 可选)
+   ↓
+2. 脚本启动 App + 注入 Frida Hook
+   ↓
+3. 等待 skip-initial 秒（跳过启动推荐视频）
+   ↓
+                                4. 手动打开目标短剧，点击播放
+                                   ↓
+5. Hook 捕获 CDN URL + AES Key
+   ↓
+6. 自动下载 + 解密 → 保存 MP4
+```
+
+```bash
+# 基础用法（自动识别剧名）
+python scripts/download_drama.py
+
+# 指定输出文件夹名（不在 App 内搜索）
+python scripts/download_drama.py -n "爹且慢，我来了"
+```
+
+#### 模式 B：搜索模式（需要 ADBKeyboard）
+
+```
+PC                              手机
+─────────────────────────────────────────────────────
+1. 运行脚本 -n "剧名" --search
+   ↓
+2. 脚本启动 App + 注入 Frida Hook
+   ↓
+3. 等待 App 启动稳定
+   ↓
+4. 自动点击"搜索"标签
+   ↓
+5. ADBKeyboard 广播输入剧名
+   ↓
+6. 自动点击搜索结果中的目标剧
+   ↓
+7. 自动跳转到指定集数（-e N）
+   ↓
+8. 视频开始播放，Hook 捕获数据
+   ↓
+9. 自动下载 + 解密 → 保存 MP4
+```
+
+```bash
+# 搜索并下载第 1 集
+python scripts/download_drama.py -n "爹且慢，我来了" --search
+
+# 搜索并从第 5 集开始
+python scripts/download_drama.py -n "爹且慢，我来了" --search -e 5
+```
+
+#### 模式 C：批量连续下载
+
+批量模式在每集下载完成后，自动通过 ADB 在 App 内切换到下一集：
+
+```bash
+# 连续下载 10 集（从第 1 集开始）
+python scripts/download_drama.py -n "剧名" --search -b 10
+
+# 连续下载全集（不限数量）
+python scripts/download_drama.py -n "剧名" --search -b
+
+# 从第 3 集开始连续下载 5 集（手动模式也支持批量）
+python scripts/download_drama.py -e 3 -b 5
+```
+
+---
+
+### 使用示例
+
+```bash
+# 示例 1：手动模式，自动识别剧名，默认 1080p
+python scripts/download_drama.py
+
+# 示例 2：搜索并下载单集
+python scripts/download_drama.py -n "爹且慢，我来了" --search -e 3
+
+# 示例 3：搜索并批量下载全集
+python scripts/download_drama.py -n "爹且慢，我来了" --search -b
+
+# 示例 4：挂载到已运行的 App（不重启 App）
+python scripts/download_drama.py --attach-running -n "剧名"
+
+# 示例 5：下载后同步生成 LLM 素材包（关键帧 + ASR 字幕）
+python scripts/download_drama.py -n "剧名" --search --preprocess
+```
+
+输出目录结构：
+
+```
+videos/
+└── 爹且慢，我来了/
+    ├── episode_001_<vid>.mp4      # 解密后可播放
+    ├── meta_ep001_<vid>.json      # 元数据（分辨率、Key、URL 等）
+    ├── episode_002_<vid>.mp4
+    ├── meta_ep002_<vid>.json
+    ├── session_manifest.jsonl     # 本次会话下载记录
+    └── llm_ready/                 # --preprocess 时生成
+        └── episode_001_<vid>/
+            ├── keyframes/         # 关键帧截图
+            ├── transcript.srt     # ASR 字幕
+            ├── transcript.txt     # 纯文本转录
+            └── manifest.json
+```
+
+---
+
+### 参数说明
+
+| 参数 | 简写 | 默认 | 说明 |
+| ---- | ---- | ---- | ---- |
+| `--name` | `-n` | 自动识别 | 输出文件夹名；配合 `--search` 时用于搜索 |
+| `--name-file` | | | 从 UTF-8 文件读取剧名（解决命令行编码问题） |
+| `--episode` | `-e` | 1 | 起始集数 |
+| `--batch` | `-b` | 不开启 | 连续下载 N 集；省略 N 表示不限集数 |
+| `--search` | | false | 自动在 App 内搜索并导航（需 ADBKeyboard） |
+| `--quality` | `-q` | 1080p | 画质：360p / 480p / 540p / 720p / 1080p |
+| `--output` | `-o` | ./videos | 输出根目录 |
+| `--timeout` | `-t` | 180 | 捕获等待超时（秒） |
+| `--skip-initial` | | 15 | 跳过启动推荐视频的等待时间（秒） |
+| `--attach-running` | | false | 挂载到已运行的 App，不重启 |
+| `--preprocess` | | false | 额外生成 LLM 素材包（关键帧 + ASR） |
+| `--whisper-model` | | large-v3 | Whisper 模型：tiny / base / small / medium / large-v3 |
+
+---
+
+## 视频解密工具
+
+`scripts/decrypt_video.py` — 独立解密工具，支持本地文件和直接从 CDN URL 下载并解密。
+
+```bash
+# 解密本地文件
+python scripts/decrypt_video.py --key <32位hex密钥> --input encrypted.mp4 --output decrypted.mp4
+
+# 从 CDN URL 直接下载并解密
+python scripts/decrypt_video.py --key <32位hex密钥> --url <cdn_url> --output decrypted.mp4
+```
+
+解密逻辑：
+
+- 解析 MP4 中的 `stsz` / `stco` / `stsc` / `senc` box，提取每个 sample 的 IV 与偏移
+- 使用 AES-128-CTR 解密每个 sample
+- 将 `encv` / `enca` 还原为原始编码格式，`sinf` box 转为 `free` box
+
+---
+
+## LLM 预处理工具
+
+`scripts/preprocess_video.py` — 将下载好的 MP4 预处理为 LLM 分析素材包。
+
+```bash
+# 处理整个剧集目录
+python scripts/preprocess_video.py videos/爹且慢，我来了
+
+# 处理单集
+python scripts/preprocess_video.py videos/爹且慢，我来了/episode_001.mp4
+
+# 使用较小模型加快转录速度
+python scripts/preprocess_video.py videos/爹且慢，我来了 --model small
+
+# 只处理指定集数
+python scripts/preprocess_video.py videos/爹且慢，我来了 --episodes 1 2 3
+```
+
+参数：
+
+| 参数 | 默认 | 说明 |
+| ---- | ---- | ---- |
+| `--model` | large-v3 | Whisper 模型大小 |
+| `--scene-threshold` | 0.20 | 场景切换检测阈值（越小帧越多） |
+| `--interval` | 2.0 | 固定间隔抽帧秒数 |
+| `--output` | `<输入目录>/llm_ready` | 输出目录 |
+
+---
+
+## r0capture 通用抓包
+
+原始 r0capture 功能保持完整，适用于任意 Android App 的 SSL/TLS 流量抓取。
+
+支持范围：
+
+- 安卓 7 ~ 16
+- 协议：HTTP/HTTPS、WebSocket、FTP、XMPP、IMAP、SMTP、Protobuf 及其 SSL 版本
+- 框架：HttpUrlConnection、OkHttp 1/3/4、Retrofit、Volley 等
+- 无视证书校验与绑定，无视整体壳/二代壳/VMP 加固
+
+```bash
+# Spawn 模式
+python r0capture.py -U -f com.coolapk.market -v
+
+# Attach 模式，保存 pcap 文件
+python r0capture.py -U 酷安 -v -p output.pcap
+```
+
+> Frida 版本对应关系：frida 17 / Android 16，frida 16.5.x / Android 14，frida 15.x / Android 12
+
+---
+
+## 致谢
+
+- 原始项目：[r0ysue/r0capture](https://github.com/r0ysue/r0capture)
+- 基础参考：[frida_ssl_logger](https://github.com/BigFaceCat2017/frida_ssl_logger)
+- ADB 中文输入：[ADBKeyBoard](https://github.com/senzhk/ADBKeyBoard)

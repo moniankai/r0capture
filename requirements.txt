@@ -1,0 +1,31 @@
+# Core dependencies (r0capture)
+frida
+frida-tools
+loguru
+click
+hexdump
+
+# PCAP analysis
+scapy
+
+# HLS download
+m3u8
+pycryptodome
+ffmpeg-python
+requests
+tqdm
+
+# File monitoring
+watchdog
+
+# Retry
+tenacity
+
+# Protobuf decoding
+blackboxprotobuf
+
+# mitmproxy (WireGuard mode)
+mitmproxy
+
+# Windows support
+win_inet_pton; sys_platform == "win32"

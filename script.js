@@ -57,8 +57,12 @@ function return_zero(args) {
 }
 function initializeGlobals() {
   var resolver = new ApiResolver("module");
+  var sslLib = libname;
+  if (sslLib.indexOf("*") === -1) {
+    sslLib = "*" + sslLib + "*";
+  }
   var exps = [
-    [Process.platform == "darwin" ? "*libboringssl*" : "*libssl*", ["SSL_read", "SSL_write", "SSL_get_fd", "SSL_get_session", "SSL_SESSION_get_id"]], // for ios and Android
+    [Process.platform == "darwin" ? "*libboringssl*" : sslLib, ["SSL_read", "SSL_write", "SSL_get_fd", "SSL_get_session", "SSL_SESSION_get_id"]], // for ios and Android
     [Process.platform == "darwin" ? "*libsystem*" : "*libc*", ["getpeername", "getsockname", "ntohs", "ntohl"]]
   ];
   // console.log(exps)

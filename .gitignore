@@ -1,0 +1,70 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# === Video / Media output ===
+videos/
+videos_redownload/
+videos_redownload_smoke/
+*.mp4
+*.mp3
+*.avi
+*.mkv
+*.mov
+*.flv
+*.ts
+*.m4a
+*.m4v
+
+# === Packet capture ===
+*.pcap
+
+# === Logs ===
+*.log
+
+# === Temp / debug artifacts ===
+.tmp/
+_*.png
+_*.xml
+
+# === Runtime JSON output (capture results, not config) ===
+all_captured_urls.json
+captured_keys.json
+cronet_urls.json
+downloader_capture.json
+mediacodec_events.json
+rankings_output.json
+rankings_raw.json
+honguo_capture_report.json
+
+# === Device data pulled via ADB ===
+app_data/
+
+# === Flash tools (unrelated binaries) ===
+MiFlash2020-3-14-0/
+miflash_unlock/
+
+# === APK / firmware images ===
+*.apk
+*.img
+
+# === Claude Code local config ===
+.claude/
+
+# === Drama output artifacts (Chinese-named dirs) ===
+*_产物/
+
+# === Session manifests (per-run, tracked inside videos/) ===
+session_manifest.jsonl
+
+# === OS / IDE ===
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
