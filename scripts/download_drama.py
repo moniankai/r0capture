@@ -75,6 +75,7 @@ class VideoRef:
     duration: int
     raw_data: Dict[str, Any]
     timestamp: float = 0.0  # 捕获时间戳（Unix 时间）
+    episode_number: Optional[int] = None  # 集数（从 Hook 提取）
     context: Dict[str, Any] = field(default_factory=dict)  # 上下文信息（预留）
 
 
@@ -84,12 +85,14 @@ class AESKey:
     key_hex: str
     bits: int
     timestamp: float = 0.0  # 捕获时间戳（Unix 时间）
+    episode_number: Optional[int] = None  # 关联的集数
     context: Dict[str, Any] = field(default_factory=dict)  # 上下文信息（预留）
 
 
 COMBINED_HOOK = r"""
 var resolver = new ApiResolver("module");
 var ffmpegLoaded = false;
+var lastEpisodeNumber = null;  // 缓存最近的 episode_number，供 Native Hook 使用
 
 // 监听 dlopen，等待 libttffmpeg.so 加载
 var dlopen = resolver.enumerateMatches("exports:*!android_dlopen_ext");
@@ -149,19 +152,72 @@ Java.perform(function() {
         return null;
     }
 
+    // 从 VideoModel 提取 episode_number
+    function extractEpisodeNumber(model) {
+        // 方案 A: 从 VideoModel 字段提取
+        try {
+            var episodeFields = ["mEpisodeNumber", "mIndex", "mOrder", "mEpisode", "episodeNum", "episodeNumber"];
+            for (var i = 0; i < episodeFields.length; i++) {
+                var field = findFieldInHierarchy(model, episodeFields[i]);
+                if (field) {
+                    var val = field.get(model);
+                    if (val !== null) {
+                        var num = parseInt(val.toString());
+                        if (!isNaN(num) && num > 0 && num < 10000) {
+                            return num;
+                        }
+                    }
+                }
+            }
+        } catch (e) {}
+
+        // 方案 B: 从 model 的标题字段提取 "第X集" 模式
+        try {
+            var titleFields = ["mEpisodeTitle", "mTitle", "mVideoTitle"];
+            for (var i = 0; i < titleFields.length; i++) {
+                var field = findFieldInHierarchy(model, titleFields[i]);
+                if (field) {
+                    var val = field.get(model);
+                    if (val !== null) {
+                        var title = val.toString();
+                        var match = title.match(/第\s*(\d+)\s*[集话]/);
+                        if (match) {
+                            var num = parseInt(match[1]);
+                            if (!isNaN(num) && num > 0 && num < 10000) {
+                                return num;
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (e) {}
+
+        // 方案 C: 返回 null（回退到 Python 端时序选择）
+        return null;
+    }
+
     var Engine = Java.use("com.ss.ttvideoengine.TTVideoEngine");
     Engine.setVideoModel.overloads.forEach(function(ov) {
         ov.implementation = function(model) {
             try {
+                // 提取 episode_number
+                var episodeNumber = extractEpisodeNumber(model);
+                lastEpisodeNumber = episodeNumber;  // 更新全局缓存
+
                 // 导出 model 层字段，包含标题和短剧信息
-                send({t: "video_model", data: dumpObj(model)});
+                send({t: "video_model", data: dumpObj(model), episode_number: episodeNumber});
 
                 var refField = findFieldInHierarchy(model, "vodVideoRef");
                 if (refField) {
                     var ref = refField.get(model);
                     if (ref) {
                         var refData = dumpObj(ref);
-                        send({t: "video_ref", data: refData});
+                        send({t: "video_ref", data: refData, episode_number: episodeNumber});
+
+                        if (episodeNumber !== null) {
+                            console.log("[Hook] Episode number: " + episodeNumber);
+                        }
+
                         // mVideoList 可能声明在父类上，需要沿继承链查找
                         var listField = findFieldInHierarchy(ref, "mVideoList");
                         if (listField) {
@@ -199,7 +255,10 @@ function hookAesInit() {
                 var bits = args[2].toInt32();
                 var dec = args[3].toInt32();
                 if (bits === 128 || bits === 256) {
-                    send({t: "AES_KEY", bits: bits, dec: dec, key: bh(args[1], bits / 8)});
+                    send({t: "AES_KEY", bits: bits, dec: dec, key: bh(args[1], bits / 8), episode_number: lastEpisodeNumber});
+                    if (lastEpisodeNumber !== null) {
+                        console.log("[AES Hook] Associated with episode: " + lastEpisodeNumber);
+                    }
                 }
             }
         });
@@ -1724,13 +1783,20 @@ def main() -> None:
         elif t == "video_ref":
             vid = p["data"].get("mVideoId", "?")
             dur = p["data"].get("mVideoDuration", 0)
-            logger.info(f"[捕获] 视频: {vid} ({dur}s)")
+            ep_num = p.get("episode_number")  # 从 Hook 提取的集数
+
+            if ep_num is not None:
+                logger.info(f"[捕获] 视频: {vid} ({dur}s) episode_number={ep_num}")
+            else:
+                logger.info(f"[捕获] 视频: {vid} ({dur}s) (episode_number 未提取)")
+
             with state.lock:
                 ref = VideoRef(
                     video_id=vid,
                     duration=dur if isinstance(dur, int) else 0,
                     raw_data=p["data"],
                     timestamp=time.time(),  # 记录捕获时间戳
+                    episode_number=ep_num,  # 新增
                     context={}
                 )
                 state.video_refs.append(ref)
@@ -1755,6 +1821,8 @@ def main() -> None:
         elif t == "AES_KEY":
             key = p["key"]
             bits = p.get("bits", 128)
+            ep_num = p.get("episode_number")  # 从 Hook 关联的集数
+
             with state.lock:
                 # 检查是否已存在相同密钥（避免重复）
                 if not any(k.key_hex == key for k in state.aes_keys):
@@ -1762,10 +1830,15 @@ def main() -> None:
                         key_hex=key,
                         bits=bits,
                         timestamp=time.time(),  # 记录捕获时间戳
+                        episode_number=ep_num,  # 新增
                         context={}
                     )
                     state.aes_keys.append(aes_key)
-            logger.info(f"  >>> AES KEY: {key} ({bits}bit)")
+
+            if ep_num is not None:
+                logger.info(f"  >>> AES KEY: {key} ({bits}bit) episode_number={ep_num}")
+            else:
+                logger.info(f"  >>> AES KEY: {key} ({bits}bit) (episode_number 未关联)")
 
     # output_dir 在首次捕获后解析，因为 drama_name 可能需要自动识别
     output_dir = ""
