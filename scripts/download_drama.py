@@ -37,6 +37,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import frida
@@ -271,6 +272,44 @@ class CaptureState:
         return best
 
 
+# 模块级全局状态（单例模式）
+_global_capture_state: Optional[CaptureState] = None
+
+
+def get_capture_state() -> CaptureState:
+    """获取全局 CaptureState 单例
+
+    Returns:
+        CaptureState: 全局捕获状态实例
+    """
+    global _global_capture_state
+    if _global_capture_state is None:
+        _global_capture_state = CaptureState()
+    return _global_capture_state
+
+
+def reset_capture_state():
+    """重置全局 CaptureState（创建新实例）
+
+    用于清空所有捕获数据，通常在开始新一轮捕获前调用。
+    """
+    global _global_capture_state
+    _global_capture_state = CaptureState()
+
+
+@dataclass
+class DownloadTaskState:
+    target_title: str
+    start_episode: int
+    user_total_episodes: int | None = None
+    locked_total_episodes: int | None = None
+    current_episode: int | None = None
+    last_confirmed_episode: int | None = None
+    consecutive_end_signals: int = 0
+    consecutive_recovery_failures: int = 0
+    first_missing_episode: int | None = None
+
+
 def run_adb(args: list[str]) -> None:
     env = {**os.environ, "MSYS_NO_PATHCONV": "1"}
     subprocess.run(["adb"] + args, capture_output=True, check=False, env=env)
@@ -287,6 +326,51 @@ def get_frida_usb_device():
         return None
 
 
+def get_running_app_pid_via_adb(app_package: str) -> int | None:
+    try:
+        result = subprocess.run(
+            ["adb", "shell", "pidof", "-s", app_package],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    if result.returncode != 0:
+        return None
+    output = (result.stdout or "").strip()
+    if not output.isdigit():
+        return None
+    return int(output)
+
+
+def select_running_app_pid(processes, app_package: str) -> int | None:
+    """从 Frida 进程列表里优先选择主进程 PID。"""
+    exact_identifier_pid = None
+    exact_name_pid = None
+    fallback_pid = None
+
+    for proc in processes:
+        identifier = getattr(proc, "identifier", "") or ""
+        name = getattr(proc, "name", "") or ""
+
+        if identifier == app_package:
+            exact_identifier_pid = proc.pid
+            break
+        if exact_name_pid is None and name == app_package:
+            exact_name_pid = proc.pid
+        if fallback_pid is None and identifier.startswith(app_package + ":"):
+            fallback_pid = proc.pid
+
+    return (
+        exact_identifier_pid
+        or exact_name_pid
+        or get_running_app_pid_via_adb(app_package)
+        or fallback_pid
+    )
+
+
 def swipe_next_episode() -> None:
     """在手机上上滑，切换到下一集。"""
     run_adb(["shell", "input", "swipe", "540", "1500", "540", "400", "300"])
@@ -294,7 +378,7 @@ def swipe_next_episode() -> None:
 
 
 def click_next_episode_button() -> bool:
-    """点击短剧播放器 UI 中的“下一集”按钮。
+    """点击短剧播放器 UI 中的"下一集"按钮。
 
     先被动读取 XML，不点击屏幕，避免误触播放/暂停。
     如果按钮不可见，再点击一次唤出控制层后重试。
@@ -404,34 +488,62 @@ def select_episode_from_ui(ep_num: int, max_attempts: int = 8) -> bool:
         except _ET_sel.ParseError:
             return False
 
-    # 先检查是否已经在详情页选集网格中，避免误触播放器区域
+    def _count_ivi_episode_buttons(xml_text: str) -> int:
+        """统计详情页真实集数按钮数量（resource-id 包含 ivi 且 text 是 1-999 的数字）。
+        用于区分真实详情页（≥5个）和搜索结果卡片内的迷你 ivi 预览（<5个）。"""
+        try:
+            root = _ET_sel.fromstring(xml_text)
+            count = 0
+            for e in root.iter():
+                if 'ivi' not in e.attrib.get('resource-id', ''):
+                    continue
+                text = e.attrib.get('text', '').strip()
+                if text.isdigit() and 1 <= int(text) <= 999:
+                    count += 1
+            return count
+        except Exception:
+            return 0
+
+    # 先检查是否已经在详情页选集网格中，避免误触播放器区域。
+    # 需要至少 5 个集数按钮（resource-id 含 ivi、text 为数字）才判定为真实详情页，
+    # 以排除搜索结果页卡片内只有 2-3 个集数预览的误判。
     _initial_xml = read_ui_xml_from_device()
-    picker_open = _initial_xml is not None and _has_ivi(_initial_xml)
+    picker_open = _initial_xml is not None and _count_ivi_episode_buttons(_initial_xml) >= 5
     if picker_open:
         logger.debug("[ADB] 剧情详情页集数网格已可见，跳过打开选集弹窗")
 
     if not picker_open:
-        # 最多尝试 3 次打开选集面板：先唤醒控制层，再点击“选集”按钮
-        # 优先通过 resource-id "joj" 或文本“选集”动态定位，失败时回退到坐标 (450,1835)
+        # 最多尝试 3 次打开选集面板：先唤醒控制层，再点击"选集"按钮
+        # 优先通过 resource-id "joj" 或文本"选集"动态定位；若 dump 期间控制层已隐藏，
+        # 重新唤醒后点击已知位置（joj 在控制层左侧，约 138,1836）。
+        _last_known_joj = None  # 记录成功定位的 joj bounds，供后续回退使用
         for _open_try in range(3):
             # 唤醒播放器控制层
             run_adb(["shell", "input", "tap", "540", "960"])
-            time.sleep(0.5)  # 200-300ms 处理 dump
+            time.sleep(1.0)  # 给控制层足够时间出现后再 dump
 
-            # 读取控制层 XML 并动态定位“选集”按钮
+            # 读取控制层 XML 并动态定位"选集"按钮
             _overlay_xml = read_ui_xml_from_device()
             _joj_bounds = None
             if _overlay_xml:
                 _joj_bounds = find_element_by_resource_id(_overlay_xml, "com.phoenix.read:id/joj")
                 if not _joj_bounds:
                     _joj_bounds = find_text_bounds(_overlay_xml, "选集")
+            if _joj_bounds:
+                _last_known_joj = _joj_bounds  # 保存成功定位结果
 
             if _joj_bounds:
                 logger.debug(f"[ADB] 找到选集按钮 bounds={_joj_bounds}，点击")
                 tap_bounds(_joj_bounds)
             else:
-                logger.debug("[ADB] 未找到选集按钮，使用备用坐标 (450,1835)")
-                run_adb(["shell", "input", "tap", "450", "1835"])
+                # dump 期间控制层已自动隐藏；重新唤醒后立刻点击已知位置，避免再次超时
+                _fallback = _last_known_joj or (96, 1808, 180, 1865)  # 实测 joj 默认位置
+                _fx = (_fallback[0] + _fallback[2]) // 2
+                _fy = (_fallback[1] + _fallback[3]) // 2
+                logger.debug(f"[ADB] 未找到选集按钮，重新唤醒后点击已知位置 ({_fx},{_fy})")
+                run_adb(["shell", "input", "tap", "540", "960"])  # 重新唤醒
+                time.sleep(0.6)
+                run_adb(["shell", "input", "tap", str(_fx), str(_fy)])  # 立刻点击 joj
             time.sleep(1.5)
 
             # 只要 XML 中出现任意 ivi 元素，就说明选集面板已经打开
@@ -449,14 +561,17 @@ def select_episode_from_ui(ep_num: int, max_attempts: int = 8) -> bool:
             time.sleep(1)
             continue
 
-        # 必要时切换到正确分段页签，例如第 35 集对应 "31-60"
-        if not range_switched and ep_num > 30:
+        # 首次尝试时点击范围页签，将选集面板定位到目标集所在分段。
+        # 对小集号（如第1集），点击"1-30"页签可将面板重置到顶部，避免依赖
+        # 可能穿透到播放器的滑动手势。仅在首次尝试（range_switched=False）时执行。
+        if not range_switched:
+            range_switched = True  # 无论成功与否，只尝试一次
             if _select_episode_range(xml_text, ep_num):
-                range_switched = True
-                xml_text = read_ui_xml_from_device()
-                if not xml_text:
-                    time.sleep(1)
-                    continue
+                logger.debug(f'[ADB] 已点击范围页签，重新读取 ivi 面板')
+                time.sleep(1.0)
+                _new_xml = read_ui_xml_from_device()
+                if _new_xml:
+                    xml_text = _new_xml
 
         # 通过 resource-id ivi 精确查找集数按钮
         target_bounds = _find_episode_button(xml_text, ep_num)
@@ -464,14 +579,50 @@ def select_episode_from_ui(ep_num: int, max_attempts: int = 8) -> bool:
             tap_bounds(target_bounds)
             logger.info(f"[ADB] 已在选集面板点击第{ep_num}集")
             time.sleep(2.5)
+            _after_select_xml = read_ui_xml_from_device()
+            if should_enter_player_from_detail(_after_select_xml):
+                if not is_target_episode_selected_in_detail(_after_select_xml, ep_num):
+                    logger.warning(f"[ADB] 点击第{ep_num}集后，高亮选中并未切到目标集，继续重试")
+                    continue
+                logger.info("[ADB] 选集后仍停在详情页，补点封面进入播放器")
+                tap_detail_cover_to_enter_player()
+                time.sleep(2.5)
             return True
 
-        # 逻辑
-        if attempt < max_attempts // 2:
-            run_adb(["shell", "input", "swipe", "540", "1780", "540", "1540", "300"])
+        # 从 ivi 元素实际 y 范围计算滚动坐标，确保手势落在选集面板内
+        _ivi_ys: list[tuple[int, int]] = []
+        try:
+            for _e in _ET_sel.fromstring(xml_text).iter():
+                if 'ivi' not in _e.attrib.get('resource-id', ''):
+                    continue
+                _bm = re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', _e.attrib.get('bounds', ''))
+                if _bm:
+                    _ivi_ys.append((int(_bm.group(2)), int(_bm.group(4))))
+        except Exception:
+            pass
+        if _ivi_ys:
+            _sy_top = _ivi_ys[0][0]
+            _sy_bot = _ivi_ys[-1][1]
+            _sy_ctr = (_sy_top + _sy_bot) // 2
+            _sdy = max(60, min(100, (_sy_bot - _sy_top) // 4))
+            _y_a = str(max(_sy_ctr - _sdy, _sy_top + 5))
+            _y_b = str(min(_sy_ctr + _sdy, _sy_bot - 5))
         else:
-            run_adb(["shell", "input", "swipe", "540", "1540", "540", "1780", "300"])
+            _y_a, _y_b = '1580', '1700'
+        # scroll_up：手指向下（y 增大），列表上滑，显示更早的集
+        # scroll_down：手指向上（y 减小），列表下滑，显示更晚的集
+        scroll_up   = ['shell', 'input', 'swipe', '540', _y_a, '540', _y_b, '500']
+        scroll_down = ['shell', 'input', 'swipe', '540', _y_b, '540', _y_a, '500']
+        if ep_num <= 15:
+            run_adb(scroll_up if attempt < max_attempts // 2 else scroll_down)
+        else:
+            run_adb(scroll_down if attempt < max_attempts // 2 else scroll_up)
         time.sleep(0.8)
+        # 滚动后确认面板仍然打开；如已消失则手势穿透到播放器，及早终止
+        _chk_xml = read_ui_xml_from_device()
+        if _chk_xml and not _has_ivi(_chk_xml):
+            logger.warning('[ADB] 滚动后选集面板已关闭（手势穿透播放器），终止滚动')
+            break
 
     logger.error(f"[ADB] 未能在选集面板找到第{ep_num}集")
     # 处理 XML 处理
@@ -555,6 +706,231 @@ def get_current_activity() -> str:
     return ""
 
 
+def is_player_page_xml(xml_text: str) -> bool:
+    """根据当前 UI XML 判断是否处于短剧播放器页。"""
+    if not xml_text:
+        return False
+
+    has_joj = 'com.phoenix.read:id/joj' in xml_text
+    has_ivi = 'com.phoenix.read:id/ivi' in xml_text
+    return (
+        'com.phoenix.read:id/jjj' in xml_text
+        or (has_joj and not has_ivi)
+        or '全屏观看' in xml_text
+        or '倍速' in xml_text
+    )
+
+
+def choose_batch_navigation_mode(xml_text: str, activity: str = "") -> str:
+    """决定批量模式下一集导航策略。"""
+    if is_player_page_xml(xml_text):
+        return "swipe"
+    if activity.endswith("PlayerActivity"):
+        return "swipe"
+    return "search"
+
+
+def should_enter_player_from_detail(xml_text: str) -> bool:
+    """选集后如果仍停在详情页，则需要补一次进入播放器动作。"""
+    if not xml_text:
+        return False
+    return (
+        'com.phoenix.read:id/ivi' in xml_text
+        and 'com.phoenix.read:id/jjj' not in xml_text
+    )
+
+
+def titles_match_loose(expected: str, actual: str) -> bool:
+    """处理阿拉伯数字到中文数字转换的宽松标题匹配。"""
+    if sanitize_drama_name(expected) == sanitize_drama_name(actual):
+        return True
+    stripped = expected.lstrip("0123456789").strip()
+    if stripped and stripped != expected and stripped in actual:
+        return True
+    return False
+
+
+def is_target_episode_selected_in_detail(xml_text: str, target_episode: int) -> bool:
+    """确认详情页当前高亮选中的确实是目标集。"""
+    if not xml_text:
+        return False
+    if not should_enter_player_from_detail(xml_text):
+        return False
+    context = parse_ui_context(xml_text)
+    return context.episode == target_episode
+
+
+def wait_for_target_episode_on_device(
+    expected_title: str,
+    expected_episode: int,
+    timeout_seconds: int = 20,
+    poll_seconds: float = 1.0,
+) -> bool:
+    """等待手机 UI 真正到达目标剧和目标集。"""
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        context = detect_ui_context_from_device()
+        if (
+            context.title
+            and titles_match_loose(expected_title, context.title)
+            and context.episode == expected_episode
+        ):
+            return True
+        time.sleep(poll_seconds)
+    return False
+
+
+def tap_detail_cover_to_enter_player() -> None:
+    """点击详情页封面区，触发当前已选剧集真正进入播放器。"""
+    run_adb(["shell", "input", "tap", "195", "474"])
+
+
+def resolve_actual_episode(
+    ui_episode: int | None,
+    hook_episode: int | None,
+    video_id: str = "",
+) -> tuple[int | None, str]:
+    """只接受 UI 或 Hook 提供的真实集号，不允许计数器兜底。"""
+    if ui_episode is not None:
+        return ui_episode, "ui"
+    if hook_episode is not None:
+        return hook_episode, "hook"
+    return None, "missing"
+
+
+def is_expected_episode(actual_episode: int | None, expected_episode: int) -> bool:
+    return actual_episode is not None and actual_episode == expected_episode
+
+
+def should_accept_out_of_order_episode(
+    actual_episode: int | None,
+    expected_episode: int,
+    expected_total_episodes: int | None,
+    output_dir: Path | None,
+    drama_name: str,
+) -> bool:
+    if actual_episode is None:
+        return False
+    if actual_episode <= expected_episode:
+        return False
+    if expected_total_episodes is not None and actual_episode > expected_total_episodes:
+        return False
+    if output_dir is None or not drama_name:
+        return False
+    return find_existing_episode_file(output_dir, drama_name, actual_episode) is None
+
+
+def find_first_missing_episode(output_dir: Path, drama_name: str, start: int = 1) -> int:
+    pattern = f"{drama_name}_episode_*.mp4"
+    existing = set()
+    for path in output_dir.glob(pattern):
+        match = re.search(r"_episode_(\d{3})(?:_[^\\/.]+)?\.mp4$", path.name)
+        if match:
+            existing.add(int(match.group(1)))
+    episode = start
+    while episode in existing:
+        episode += 1
+    return episode
+
+
+def find_existing_episode_file(output_dir: Path, drama_name: str, episode: int) -> Path | None:
+    pattern = f"{drama_name}_episode_{episode:03d}*.mp4"
+    matches = sorted(output_dir.glob(pattern))
+    if matches:
+        return matches[0]
+    legacy = output_dir / f"{drama_name}_episode_{episode:03d}.mp4"
+    if legacy.exists():
+        return legacy
+    return None
+
+
+def resolve_start_episode(
+    explicit_episode: int,
+    resume_enabled: bool,
+    output_dir: Path | None,
+    drama_name: str = "",
+) -> int:
+    if not resume_enabled or output_dir is None or not drama_name:
+        return explicit_episode
+    return find_first_missing_episode(output_dir, drama_name, start=explicit_episode)
+
+
+def choose_effective_total_episodes(
+    user_total: int | None,
+    locked_total: int | None,
+    ui_total: int | None,
+) -> tuple[int | None, str]:
+    if user_total:
+        return user_total, "user"
+    if locked_total:
+        return locked_total, "locked"
+    if ui_total:
+        return ui_total, "ui"
+    return None, "missing"
+
+
+def should_stop_for_total(current_episode: int, expected_total: int | None) -> bool:
+    return expected_total is not None and current_episode >= expected_total
+
+
+def register_total_episodes(
+    task_state: DownloadTaskState,
+    ui_total: int | None,
+) -> tuple[int | None, str, str | None]:
+    warning = None
+    if ui_total:
+        if task_state.user_total_episodes:
+            if ui_total != task_state.user_total_episodes:
+                warning = (
+                    f"UI 读到总集数 {ui_total}，但用户指定为 {task_state.user_total_episodes}"
+                )
+        elif task_state.locked_total_episodes is None:
+            task_state.locked_total_episodes = ui_total
+    total, source = choose_effective_total_episodes(
+        user_total=task_state.user_total_episodes,
+        locked_total=task_state.locked_total_episodes,
+        ui_total=ui_total,
+    )
+    return total, ("locked" if source == "ui" and task_state.locked_total_episodes else source), warning
+
+
+def should_stop_for_end_signal(
+    task_state: DownloadTaskState,
+    saw_end_signal: bool,
+) -> bool:
+    if saw_end_signal:
+        task_state.consecutive_end_signals += 1
+    else:
+        task_state.consecutive_end_signals = 0
+    return task_state.consecutive_end_signals >= 2
+
+
+def mark_confirmed_episode(task_state: DownloadTaskState, episode: int) -> None:
+    """记录一次已确认的有效剧集，并清空恢复失败计数。"""
+    task_state.current_episode = episode
+    task_state.last_confirmed_episode = episode
+    task_state.consecutive_recovery_failures = 0
+    should_stop_for_end_signal(task_state, False)
+
+
+def register_recovery_failure(
+    task_state: DownloadTaskState,
+    saw_end_signal: bool,
+) -> bool:
+    """记录一次完整恢复链失败；只有强结束信号才参与终止判定。"""
+    task_state.consecutive_recovery_failures += 1
+    return should_stop_for_end_signal(task_state, saw_end_signal)
+
+
+def can_treat_duplicate_as_cache_artifact(
+    allow_duplicate_skip: bool,
+    actual_episode: int | None,
+    expected_episode: int,
+) -> bool:
+    """仅允许直接上滑路径上的重复视频容错。"""
+    return allow_duplicate_skip and actual_episode == expected_episode
+
+
 def open_search_via_deeplink() -> bool:
     """使用 App 的 deeplink scheme 打开搜索页。
 
@@ -566,9 +942,17 @@ def open_search_via_deeplink() -> bool:
          "-d", "dragon8662://search", APP_PACKAGE],
         capture_output=True, check=False, env=env,
     )
-    time.sleep(2.0)
+    # 从视频播放器切换到搜索页面需要 3-4 秒；视频渲染期间 uiautomator 可能返回 rc=137
+    time.sleep(3.5)
 
-    xml_text = read_ui_xml_from_device()
+    # rc=137 表示 dump 进程被系统杀掉（视频渲染竞争资源），最多重试 3 次
+    xml_text = ''
+    for _d in range(3):
+        xml_text = read_ui_xml_from_device()
+        if xml_text:
+            break
+        logger.debug(f'[搜索] deeplink dump 失败，1.5s 后重试 ({_d + 1}/3)...')
+        time.sleep(1.5)
     if not xml_text:
         return False
     if find_element_by_resource_id(xml_text, "com.phoenix.read:id/h7h"):
@@ -783,7 +1167,68 @@ def _find_search_result(xml_text: str, name: str) -> tuple | None:
     return matched_non_sequel or matched_any
 
 
-def _try_start_episode_on_drama_page(ep_num: int) -> bool:
+def choose_search_result_bounds(xml_text: str, name: str) -> tuple[int, int, int, int] | None:
+    """优先选择最像目标剧名的搜索结果卡，避免模糊匹配误点。"""
+    import xml.etree.ElementTree as _ET
+
+    search_input_ids = {'com.phoenix.read:id/h7h'}
+    sequel_markers = (
+        '第二部', '第三部', '第四部', '第五部', '第六部',
+        '第七部', '第八部', '第九部', '第十部', '续集',
+    )
+
+    def elem_bounds(elem) -> tuple[int, int, int, int] | None:
+        bounds_str = elem.attrib.get('bounds', '')
+        match = re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', bounds_str)
+        if not match:
+            return None
+        bounds = tuple(int(part) for part in match.groups())
+        if bounds[1] <= 150:
+            return None
+        if elem.attrib.get('resource-id', '') in search_input_ids:
+            return None
+        return bounds
+
+    keys = _name_search_keys(name)
+    candidates: list[tuple[int, tuple[int, int, int, int]]] = []
+    try:
+        root = _ET.fromstring(xml_text)
+    except _ET.ParseError:
+        return None
+
+    for elem in root.iter():
+        rid = elem.attrib.get('resource-id', '')
+        text = (elem.attrib.get('text') or '').strip()
+        if not text:
+            continue
+
+        bounds = elem_bounds(elem)
+        if not bounds:
+            continue
+
+        score = 0
+        if rid == 'com.phoenix.read:id/jy3':
+            score += 20
+        if text == name:
+            score += 100
+        elif name and name in text:
+            score += 80
+        elif rid == 'com.phoenix.read:id/jy3' and any(key and key in text for key in keys):
+            score += 40
+        else:
+            continue
+
+        if any(marker in text for marker in sequel_markers):
+            score -= 10
+        candidates.append((score, bounds))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def _try_start_episode_on_drama_page(ep_num: int, clear_state_fn=None) -> bool:
     """进入短剧详情页或选集页后，点击目标集。
 
     如果已经在播放器页（会自动播放），或成功点击集数按钮触发播放，则返回 True。
@@ -795,19 +1240,22 @@ def _try_start_episode_on_drama_page(ep_num: int) -> bool:
     if not xml_text:
         return False
 
+    # 播放器控制层可能处于隐藏态（无 jjj/joj/全屏观看/倍速），
+    # 且详情页 ivi 网格也不可见时，先点击屏幕中心唤出控制层，再重新读取 UI。
+    if not is_player_page_xml(xml_text) and 'com.phoenix.read:id/ivi' not in xml_text:
+        logger.debug('[搜索] 控制层不可见，尝试点击屏幕中心唤出')
+        run_adb(["shell", "input", "tap", "540", "960"])
+        time.sleep(1.2)
+        _woken_xml = read_ui_xml_from_device()
+        if _woken_xml:
+            xml_text = _woken_xml
+
     # 播放器页检测：
-    # - jjj：集数指示（如“第1集”），只出现在播放器页
-    # - joj：“选集”按钮，播放器页和详情页都会出现，不能单独作为判断依据
+    # - jjj：集数指示（如"第1集"），只出现在播放器页
+    # - joj："选集"按钮，播放器页和详情页都会出现，不能单独作为判断依据
     # - 只有当 ivi（选集网格按钮）不存在时，才结合 joj 判断播放器页
-    # - “全屏观看”/“倍速”：播放器控制项
-    has_joj = 'com.phoenix.read:id/joj' in xml_text
-    has_ivi = 'com.phoenix.read:id/ivi' in xml_text
-    is_player_page = (
-        'com.phoenix.read:id/jjj' in xml_text          # 集数指示，只在播放器页出现
-        or (has_joj and not has_ivi)                    # 有“选集”但无选集网格，视为播放器页
-        or '全屏观看' in xml_text
-        or '倍速' in xml_text
-    )
+    # - "全屏观看"/"倍速"：播放器控制项
+    is_player_page = is_player_page_xml(xml_text)
     if is_player_page:
         # 检测播放器当前实际集号，不能假设是第1集
         current_playing_ep = None
@@ -825,11 +1273,20 @@ def _try_start_episode_on_drama_page(ep_num: int) -> bool:
         if current_playing_ep is not None and current_playing_ep == ep_num:
             logger.info(f"[搜索] 播放器已在第{current_playing_ep}集，与目标一致")
             return True
-        # 需要切集：检查 select_episode_from_ui 返回值
+        # 需要切集
         if current_playing_ep is not None:
             logger.info(f"[搜索] 播放器当前在第{current_playing_ep}集，需切换到第 {ep_num} 集")
         else:
             logger.warning(f"[搜索] 播放器页面无法识别当前集号，尝试导航到第 {ep_num} 集")
+
+        # 从播放器直接打开选集面板切换集数。
+        # 注：不再先按 BACK 退回搜索结果页——BACK 会落在搜索结果页（详情页不在回退栈），
+        # 导致 select_episode_from_ui 的备用坐标误点其他剧的搜索结果卡片。
+        logger.info(f'[搜索] 在播放器中直接打开选集面板，切换到第 {ep_num} 集')
+        # 搜索后 App 会自动播放"续播"集（非目标集），Hook 已将其写入 state。
+        # 点击 picker 前清空 state，确保 _snap_refs[0] 是目标集而非续播集。
+        if clear_state_fn:
+            clear_state_fn()
         if not select_episode_from_ui(ep_num):
             logger.error(f"[搜索] 选集面板未能切换到第 {ep_num} 集")
             return False
@@ -845,9 +1302,16 @@ def _try_start_episode_on_drama_page(ep_num: int) -> bool:
                 bounds_str = elem.attrib.get('bounds', '')
                 m = re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', bounds_str)
                 if m:
+                    if clear_state_fn:
+                        clear_state_fn()  # 清除搜索自动播放污染的 state；点击后 Hook 重新填入目标集数据
                     tap_bounds(tuple(int(p) for p in m.groups()))
                     logger.info(f"[搜索] 已在剧情详情页点击第 {ep_num} 集")
                     time.sleep(2.5)
+                    _after_select_xml = read_ui_xml_from_device()
+                    if should_enter_player_from_detail(_after_select_xml):
+                        logger.info("[搜索] 选集后仍停在详情页，补点封面进入播放器")
+                        tap_detail_cover_to_enter_player()
+                        time.sleep(2.5)
                     return True
     except _ET.ParseError:
         pass
@@ -859,6 +1323,8 @@ def _try_start_episode_on_drama_page(ep_num: int) -> bool:
         if xml_text:
             bounds = _find_episode_button(xml_text, ep_num)
             if bounds:
+                if clear_state_fn:
+                    clear_state_fn()  # 清除搜索自动播放污染的 state
                 tap_bounds(bounds)
                 logger.info(f"[搜索] 已切换范围并点击第 {ep_num} 集")
                 time.sleep(2.5)
@@ -868,6 +1334,8 @@ def _try_start_episode_on_drama_page(ep_num: int) -> bool:
     for play_text in ('立即播放', '继续播放', '播放'):
         b = find_text_bounds(xml_text, play_text)
         if b and b[1] > 150:
+            if clear_state_fn:
+                clear_state_fn()  # 清除搜索自动播放污染的 state
             tap_bounds(b)
             logger.info(f"[搜索] 已点击 '{play_text}' 按钮")
             time.sleep(2.5)
@@ -876,14 +1344,14 @@ def _try_start_episode_on_drama_page(ep_num: int) -> bool:
     return False
 
 
-def search_drama_in_app(name: str, start_episode: int = 1) -> bool:
+def search_drama_in_app(name: str, start_episode: int = 1, clear_state_fn=None) -> bool:
     """在红果 App 内按剧名搜索，并导航到目标剧集。
 
     策略（每步都有主路径和回退路径）：
       1. 通过 deeplink ``dragon8662://search`` 打开搜索页；
          回退路径：返回主页后点击坐标 (1035, 80) 的搜索图标。
       2. 通过 resource-id ``h7h`` 查找 EditText，清空并用 ADBKeyboard 输入。
-      3. 通过 resource-id ``h96`` 点击“搜索”按钮；回退路径：发送 ENTER。
+      3. 通过 resource-id ``h96`` 点击"搜索"按钮；回退路径：发送 ENTER。
       4. 通过 resource-id ``jy3`` 查找结果；回退路径：文本匹配。
       5. 如果 start_episode > 1，则进入对应集。
 
@@ -897,7 +1365,7 @@ def search_drama_in_app(name: str, start_episode: int = 1) -> bool:
     # 先按 HOME 退出可能存在的播放器页；该 App 中 BACK 不会可靠退出播放器，
     # 从播放器上下文发送 deeplink 会被拦截。HOME 会回到 Android 桌面，使 deeplink 更稳定。
     run_adb(["shell", "input", "keyevent", "KEYCODE_HOME"])
-    time.sleep(2.0)  # 等待桌面稳定后再发送 deeplink
+    time.sleep(3.5)  # 等待视频渲染停止后再发送 deeplink（视频播放时 uiautomator 易被杀掉）
 
     # 方法 A：deeplink；最多尝试 2 次，规避播放器退出后的偶发时序问题
     for attempt in range(2):
@@ -909,7 +1377,7 @@ def search_drama_in_app(name: str, start_episode: int = 1) -> bool:
             # 第一次失败后，再按一次 HOME 并稍等更久后重试
             logger.info("[搜索] 深度链接第1次失败，稍等后重试...")
             run_adb(["shell", "input", "keyevent", "KEYCODE_HOME"])
-            time.sleep(2.5)
+            time.sleep(3.5)
 
     # 方法 B：通过 am start 启动 App，再点击搜索图标
     if not search_page_ready:
@@ -992,7 +1460,7 @@ def search_drama_in_app(name: str, start_episode: int = 1) -> bool:
     for attempt in range(8):
         xml_text = read_ui_xml_from_device()
         if xml_text:
-            bounds = _find_search_result(xml_text, name)
+            bounds = choose_search_result_bounds(xml_text, name)
             if bounds:
                 tap_bounds(bounds)
                 logger.info(f"[搜索] 已点击搜索结果: 《{name}》")
@@ -1022,11 +1490,19 @@ def search_drama_in_app(name: str, start_episode: int = 1) -> bool:
 
     # ---- 步骤 6：开始播放目标集 ----
     # 短剧详情页不会自动播放，必须显式点击集数按钮。
-    if not _try_start_episode_on_drama_page(start_episode):
-        # 回退方案：已在播放器中时使用播放器内选集面板
-        if start_episode > 1:
-            if not select_episode_from_ui(start_episode):
-                logger.warning(f"[搜索] 无法自动选集，请手动选择第 {start_episode} 集")
+    if not _try_start_episode_on_drama_page(start_episode, clear_state_fn=clear_state_fn):
+        # 回退方案：_try_start_episode_on_drama_page 未能导航时，
+        # 无论目标集是否为第1集，都通过选集面板强制跳集。
+        # 注意：之前此处有 `if start_episode > 1` 守卫，导致第1集时跳过了导航，
+        # App 续播直接进入播放器后控制层隐藏，脚本无法确认集号，捕获超时。
+        if clear_state_fn:
+            clear_state_fn()  # 回退路径：picker 直接选集前也要清空 state
+        if not select_episode_from_ui(start_episode):
+            logger.warning(f"[搜索] 无法自动选集，请手动选择第 {start_episode} 集")
+
+    if not wait_for_target_episode_on_device(name, start_episode, timeout_seconds=40, poll_seconds=1):
+        logger.warning(f"[搜索] 导航后仍未确认到达第{start_episode}集，搜索失败")
+        return False
 
     logger.info("[搜索] 导航完成，等待视频数据捕获...")
     return True
@@ -1055,6 +1531,8 @@ def main() -> None:
     parser.add_argument("--name", "-n", default="", help="剧名（留空则自动识别）")
     parser.add_argument("--name-file", default="", help="从 UTF-8 文本文件读取目标剧名，避免命令行编码问题")
     parser.add_argument("--episode", "-e", type=int, default=1, help="起始集数")
+    parser.add_argument("--resume", action="store_true", help="根据已落盘文件自动从第一个缺失集数继续")
+    parser.add_argument("--total-episodes", type=int, default=0, help="用户提供的总集数；优先于 UI 动态总集数")
     parser.add_argument("--output", "-o", default="./videos", help="输出根目录")
     parser.add_argument("--quality", "-q", default="1080p",
                         choices=["360p", "480p", "540p", "720p", "1080p"], help="画质")
@@ -1080,9 +1558,15 @@ def main() -> None:
     expected_drama_name = args.name
     drama_name = args.name  # 可能为空，首次捕获后会自动识别
     output_root = args.output
+    user_total_episodes = args.total_episodes or None
 
     state = CaptureState()
     session_state = SessionValidationState()
+    task_state = DownloadTaskState(
+        target_title=expected_drama_name or "",
+        start_episode=args.episode,
+        user_total_episodes=user_total_episodes,
+    )
 
     def on_message(msg, data):
         if msg["type"] != "send":
@@ -1202,10 +1686,29 @@ def main() -> None:
         session_manifest_path = os.path.join(output_dir, "session_manifest.jsonl")
         return output_dir
 
+    def update_total_episodes(ui_total: int | None) -> tuple[int | None, str]:
+        total, source, warning = register_total_episodes(task_state, ui_total)
+        if warning:
+            logger.warning(f"[总集数] {warning}，继续使用用户值")
+        return total, source
+
+    planned_start_episode = args.episode
+    # 仅在剧名启动前已知时，才允许做 resume 预扫描
+    if expected_drama_name:
+        resolve_output_dir()
+        planned_start_episode = resolve_start_episode(
+            explicit_episode=args.episode,
+            resume_enabled=args.resume,
+            output_dir=Path(output_dir) if output_dir else None,
+            drama_name=drama_name,
+        )
+        task_state.start_episode = planned_start_episode
+        task_state.first_missing_episode = planned_start_episode
+
     # === 步骤 1：启动 App + Hook ===
     logger.info("=" * 55)
     logger.info(f"  红果短剧下载器")
-    logger.info(f"  目标: {drama_name or '(自动识别)'} 第{args.episode}集")
+    logger.info(f"  目标: {drama_name or '(自动识别)'} 第{planned_start_episode}集")
     logger.info(f"  画质: {args.quality}")
     logger.info("=" * 55)
 
@@ -1214,17 +1717,7 @@ def main() -> None:
         return
     if args.attach_running:
         logger.info("\n[1/5] Attach to running App...")
-        pid = None
-        fallback_pid = None
-        for proc in device.enumerate_processes():
-            proc_identifier = getattr(proc, "identifier", "") or getattr(proc, "name", "")
-            if proc_identifier == APP_PACKAGE:
-                pid = proc.pid
-                break
-            if fallback_pid is None and proc_identifier.startswith(APP_PACKAGE + ":"):
-                fallback_pid = proc.pid
-        if pid is None and fallback_pid is not None:
-            pid = fallback_pid
+        pid = select_running_app_pid(device.enumerate_processes(), APP_PACKAGE)
         if pid is None:
             logger.error(f"{APP_PACKAGE} is not running; cannot attach")
             return
@@ -1264,7 +1757,7 @@ def main() -> None:
         time.sleep(wait_time)
         state.clear()
         logger.info("  已清除启动数据，开始自动搜索...")
-        search_ok = search_drama_in_app(args.name, start_episode=args.episode)
+        search_ok = search_drama_in_app(args.name, start_episode=planned_start_episode, clear_state_fn=state.clear)
         if not search_ok:
             logger.warning("  自动搜索失败，请手动在手机上打开目标剧集，脚本将继续等待")
     elif args.skip_initial > 0:
@@ -1276,12 +1769,21 @@ def main() -> None:
         logger.info("\n[3/5] skip-initial=0, keeping capture data from app startup")
 
     # === 步骤 3：等待 + 下载循环 ===
-    current_ep = args.episode
+    current_ep = planned_start_episode if expected_drama_name else resolve_start_episode(
+        explicit_episode=args.episode,
+        resume_enabled=args.resume,
+        output_dir=Path(output_dir) if output_dir else None,
+        drama_name=drama_name,
+    )
+    task_state.start_episode = current_ep
+    task_state.first_missing_episode = current_ep
+    task_state.current_episode = current_ep
 
-    def wait_for_capture() -> bool:
+    def wait_for_capture(timeout_seconds: int | None = None) -> bool:
         """等待捕获 URL 和 AES key；超时时返回 False。"""
+        effective_timeout = timeout_seconds or args.timeout
         start_wait = time.time()
-        while time.time() - start_wait < args.timeout:
+        while time.time() - start_wait < effective_timeout:
             if state.has_data:
                 time.sleep(1)  # 等待剩余分辨率 URL 到达；缩短窗口可减少下一集预加载污染
                 logger.info("  URL + Key 均已捕获!")
@@ -1295,25 +1797,21 @@ def main() -> None:
                     parts.append(f"Key: {len(state.aes_keys)}个")
                 logger.info(f"  [{elapsed}s] {', '.join(parts) or '等待中...'}")
             time.sleep(1)
-        logger.error(f"超时 {args.timeout}s，未捕获到完整数据")
+        logger.error(f"超时 {effective_timeout}s，未捕获到完整数据")
         return False
 
     def _titles_match(expected: str, actual: str) -> bool:
-        """处理阿拉伯数字到中文数字转换的宽松标题匹配。
-
-        E.g. "18岁太奶奶驾到，重整家族荣耀" should match "十八岁太奶奶驾到，重整家族荣耀".
-        """
-        if sanitize_drama_name(expected) == sanitize_drama_name(actual):
-            return True
-        # 逻辑逻辑
-        stripped = expected.lstrip("0123456789").strip()
-        if stripped and stripped != expected and stripped in actual:
-            return True
-        return False
+        return titles_match_loose(expected, actual)
 
     def download_and_decrypt(ep_num: int) -> dict:
         """在 UI 校验后下载并解密当前捕获的视频。"""
         ui_context = detect_ui_context_from_device()
+        if ui_context.episode is None:
+            run_adb(["shell", "input", "tap", "540", "960"])
+            time.sleep(0.8)
+            retried_context = detect_ui_context_from_device()
+            if retried_context.episode is not None or retried_context.title:
+                ui_context = retried_context
         logger.debug(
             f"[validate] ep={ep_num} ui_title={ui_context.title!r} "
             f"locked={session_state.locked_title!r}"
@@ -1325,20 +1823,66 @@ def main() -> None:
 
         resolve_output_dir(ui_context)
 
-        if not _snap_keys:
-            logger.error("Missing AES key")
-            return {"success": False, "reason": "missing_key"}
-
         # 在锁内拍一致性快照，避免 Frida 回调线程并发修改
         with state.lock:
             _snap_refs = list(state.video_refs)
             _snap_keys = list(state.aes_keys)
             _snap_episodes = dict(state.captured_episodes)
-        vid = _snap_refs[-1].get("mVideoId", "unknown") if _snap_refs else "unknown"
+
+        if not _snap_keys:
+            logger.error("Missing AES key")
+            return {"success": False, "reason": "missing_key"}
+
+        # 取第一个捕获的视频 ref：picker 选集后先触发目标集，后触发下一集预加载。
+        # 用 [-1] 会错误选中预加载集，用 [0] 始终选中我们显式选择的目标集。
+        vid = _snap_refs[0].get("mVideoId", "unknown") if _snap_refs else "unknown"
+        _hook_ep = _snap_episodes.get(vid)
+        actual_episode, episode_source = resolve_actual_episode(
+            ui_episode=ui_context.episode,
+            hook_episode=_hook_ep,
+            video_id=vid,
+        )
+        if actual_episode is None:
+            logger.error(f"[集号] UI 和 Hook 均未检测到真实集号，拒绝落盘 (vid={vid})")
+            return {"success": False, "reason": "missing_episode"}
+        # 上滑过渡期：播放器 UI 集数可能滞后 1 集，重试几次再判断。
+        # 避免 state.clear() 误毁 Hook 刚捕获的有效数据，触发 recovery 连锁。
+        if actual_episode is not None and actual_episode == ep_num - 1:
+            for _ui_retry in range(3):
+                logger.debug(
+                    f"[集号] UI 显示第{actual_episode}集（目标第{ep_num}集），"
+                    f"可能是上滑过渡，3s 后重试 ({_ui_retry + 1}/3)"
+                )
+                time.sleep(3)
+                ui_context = detect_ui_context_from_device()
+                actual_episode, episode_source = resolve_actual_episode(
+                    ui_episode=ui_context.episode,
+                    hook_episode=_hook_ep,
+                    video_id=vid,
+                )
+                if actual_episode == ep_num:
+                    break
+        if not is_expected_episode(actual_episode, ep_num):
+            effective_total, _ = update_total_episodes(ui_context.total_episodes)
+            if should_accept_out_of_order_episode(
+                actual_episode=actual_episode,
+                expected_episode=ep_num,
+                expected_total_episodes=effective_total,
+                output_dir=Path(output_dir) if output_dir else None,
+                drama_name=drama_name,
+            ):
+                logger.warning(f"[集号] 实际集号为第{actual_episode}集，当前目标是第{ep_num}集；先按实际缺口集落盘")
+                ep_num = actual_episode
+            else:
+                logger.error(f"[集号] 实际集号为第{actual_episode}集，但当前目标是第{ep_num}集，拒绝落盘")
+                return {
+                    "success": False,
+                    "reason": "unexpected_episode",
+                    "episode": actual_episode,
+                }
+
         # 把实际 UI 标题传给 validate_round，避免 "18岁" 与 "十八岁" 这类数字形式差异阻塞校验。
         # 标题正确性已在上面的 _titles_match 中验证。
-        # UI 逻辑处理
-        # 逻辑逻辑
         effective_expected = (
             ui_context.title
             or session_state.locked_title
@@ -1350,25 +1894,16 @@ def main() -> None:
             ui_context,
             vid,
             expected_title=effective_expected,
-            fallback_episode=ep_num,
+            fallback_episode=actual_episode,
         )
         if not ok:
             logger.error(f"Round validation failed: {reason}")
             return {"success": False, "reason": reason, "episode": ui_context.episode}
 
-        # 集号优先级：UI 检测 > Hook 提取（按 video_id 绑定）> 计数器（附警告）
-        _hook_ep = _snap_episodes.get(vid)
-        if ui_context.episode is not None:
-            actual_episode = ui_context.episode
-        elif _hook_ep is not None:
-            actual_episode = _hook_ep
+        if episode_source == "hook":
             logger.info(f"[集号] UI 未检测到集号，使用 Hook 捕获值: 第{actual_episode}集 (vid={vid})")
-        else:
-            actual_episode = ep_num
-            logger.warning(
-                f"[集号] UI 和 Hook 均未检测到集号，回退使用计数器值: {ep_num}（可能不准确！）"
-            )
-        key_hex = _snap_keys[-1]
+        # 同理，取第一个 key：对应第一个（目标集）而非预加载集的密钥。
+        key_hex = _snap_keys[0]
 
         best = state.best_video(args.quality, video_id=vid)
         if not best:
@@ -1475,34 +2010,28 @@ def main() -> None:
 
         return {"success": True, "episode": actual_episode, "total_episodes": ui_context.total_episodes}
 
-    # 首集：如果文件已存在则跳过
-    first_ep_path, _ = build_episode_paths(
-        output_dir, current_ep, '', drama_name=drama_name,
-    )
-    if os.path.exists(first_ep_path) and os.path.getsize(first_ep_path) > 0:
-        logger.info(f"\n  第{current_ep}集已存在，跳过: {os.path.basename(first_ep_path)}")
-        first_result = {"success": True, "episode": current_ep}
+    if args.search:
+        logger.info(f"\n等待第 {current_ep} 集数据捕获（视频应已自动开始）...")
     else:
-        if args.search:
-            logger.info(f"\n等待第 {current_ep} 集数据捕获（视频应已自动开始）...")
-        else:
-            logger.info(f"\n请在手机上播放第{current_ep}集...")
-        logger.info("  当检测到视频 URL + AES 密钥后将自动开始下载\n")
+        logger.info(f"\n请在手机上播放第{current_ep}集...")
+    logger.info("  当检测到视频 URL + AES 密钥后将自动开始下载\n")
 
+    if not wait_for_capture():
+        try:
+            session.detach()
+        except Exception:
+            pass
+        return
+
+    first_result = download_and_decrypt(current_ep)
+    while not first_result.get("success") and first_result.get("reason") in {"title_mismatch", "unexpected_episode"}:
+        logger.warning("启动轮次未落到目标剧/目标集；清空捕获并重新定位。")
+        state.clear()
+        if args.search and expected_drama_name:
+            search_drama_in_app(expected_drama_name, current_ep, clear_state_fn=state.clear)
         if not wait_for_capture():
-            try:
-                session.detach()
-            except Exception:
-                pass
-            return
-
+            break
         first_result = download_and_decrypt(current_ep)
-        while not first_result.get("success") and first_result.get("reason") == "title_mismatch":
-            logger.warning("Captured a non-target drama during startup; clear state and keep waiting.")
-            state.clear()
-            if not wait_for_capture():
-                break
-            first_result = download_and_decrypt(current_ep)
 
     if not first_result.get("success"):
         try:
@@ -1511,7 +2040,8 @@ def main() -> None:
             pass
         return
     current_ep = first_result.get("episode", current_ep)
-    total_eps = first_result.get("total_episodes")  # 跨循环保留总集数
+    mark_confirmed_episode(task_state, current_ep)
+    total_eps, _ = update_total_episodes(first_result.get("total_episodes"))  # 跨循环保留总集数
 
     # 逻辑
     if args.batch is not None:
@@ -1522,47 +2052,94 @@ def main() -> None:
         logger.info(f"\n{'=' * 55}")
         logger.info(f"  连续模式 — 将自动上滑切换下一集")
         if args.batch > 0:
-            logger.info(f"  计划下载: {max_eps} 集 (从第{args.episode}集开始)")
+            logger.info(f"  计划下载: {max_eps} 集 (从第{task_state.start_episode}集开始)")
         logger.info("  按 Ctrl+C 随时退出")
         logger.info(f"{'=' * 55}")
+
+        def handle_episode_result(
+            result: dict,
+            expected_ep: int,
+            allow_duplicate_skip: bool = False,
+        ) -> tuple[bool, bool, str | None]:
+            nonlocal current_ep, total_eps, downloaded
+            if result.get("success"):
+                downloaded += 1
+                current_ep = result.get("episode", expected_ep)
+                mark_confirmed_episode(task_state, current_ep)
+                total_eps, _ = update_total_episodes(result.get("total_episodes"))
+                if should_stop_for_total(current_ep, total_eps):
+                    logger.info(f"已到达最后一集（共{total_eps}集），停止下载")
+                    return True, True, None
+                return True, False, None
+
+            reason = result.get('reason', 'unknown_error')
+            if reason == 'duplicate_video_id':
+                if can_treat_duplicate_as_cache_artifact(
+                    allow_duplicate_skip=allow_duplicate_skip,
+                    actual_episode=result.get("episode"),
+                    expected_episode=expected_ep,
+                ):
+                    logger.warning(f"  第{expected_ep}集视频重复（上滑预加载缓存），按已确认轮次继续")
+                    current_ep = expected_ep
+                    downloaded += 1
+                    mark_confirmed_episode(task_state, current_ep)
+                    return True, False, reason
+                logger.warning(f"  第{expected_ep}集视频重复，但当前不是可容错的上滑缓存场景，继续恢复")
+                return False, False, reason
+            if reason in {'title_mismatch', 'episode_not_ascending', 'missing_episode', 'unexpected_episode'}:
+                logger.warning(f"  第{expected_ep}集出现结束信号({reason})，准备恢复")
+                return False, False, reason
+            logger.error(f"Episode {expected_ep} failed: {reason}")
+            return False, True, reason
+
+        def try_player_panel_recovery(expected_ep: int) -> tuple[bool, bool, str | None]:
+            # state 已在批量循环开头清空，此处直接打开选集面板切换目标集
+            logger.info(f"[恢复] 打开选集面板并跳转到第{expected_ep}集")
+            if not select_episode_from_ui(expected_ep):
+                logger.warning(f"[恢复] 选集面板无法跳到第{expected_ep}集")
+                return False, False, "panel_navigation_failed"
+            time.sleep(3)  # 给 UI 足够时间显示新集数
+            logger.info(f"[恢复] 等待第{expected_ep}集捕获数据...")
+            if not wait_for_capture(timeout_seconds=75):  # 实测选集后 Hook 可能需要 60s+
+                logger.warning(f"[恢复] 第{expected_ep}集在选集恢复后仍未捕获到数据")
+                return False, False, "missing_capture"
+            return handle_episode_result(
+                download_and_decrypt(expected_ep),
+                expected_ep,
+                allow_duplicate_skip=False,
+            )
 
         try:
             while downloaded < max_eps:
                 expected_ep = current_ep + 1
 
-                # 逻辑
-                if total_eps and expected_ep > total_eps:
+                if should_stop_for_total(expected_ep, total_eps):
                     logger.info(f"已到达最后一集（共{total_eps}集），停止下载")
                     break
 
-                # 逻辑
-                ep_path, _ = build_episode_paths(
-                    output_dir, expected_ep, '', drama_name=drama_name,
-                )
-                if os.path.exists(ep_path) and os.path.getsize(ep_path) > 0:
-                    logger.info(f"\n  第{expected_ep}集已存在，跳过: {os.path.basename(ep_path)}")
-                    downloaded += 1
-                    current_ep = expected_ep
+                state.clear()
+                time.sleep(1)
+                last_reason = None
+                # 上滑手势在实测中不可靠：UI 集数不更新且预加载会污染 state（ep_N+2 覆盖 ep_N+1）
+                # 直接用选集面板切集，是唯一可靠且结果可验证的导航路径。
+                logger.info(f"[批量] 使用选集面板直接切到第{expected_ep}集")
+                handled, should_break, panel_reason = try_player_panel_recovery(expected_ep)
+                if panel_reason:
+                    last_reason = panel_reason
+                if should_break:
+                    break
+                if handled:
                     continue
 
+                logger.warning(f"[批量] 选集恢复失败，最后兜底回搜索页重定位第{expected_ep}集")
                 state.clear()
-
-                # 逻辑处理
-                # 通过完整搜索进入短剧详情页，再导航到下一集。
-                # 在这个 App 中，从播放器按 BACK 不会返回详情页。
-                # _try_start_episode_on_drama_page 在播放器页也可能返回 True，回退逻辑不可靠。
-                # 只有 search_drama_in_app 能稳定到达详情页；在详情页点击集数按钮会触发
-                # setVideoModel 和完整 URL 解析，随后 video_info 触发、video_urls 填充，捕获成功。
-                time.sleep(1)
-                # 导航最多重试 2 次，避免单次 deeplink 时序抖动中断整个批量流程
-                # 处理回退
                 nav_ok = False
                 for nav_attempt in range(2):
-                    nav_ok = search_drama_in_app(drama_name, expected_ep)
+                    nav_ok = search_drama_in_app(drama_name, expected_ep, clear_state_fn=state.clear)
                     if nav_ok:
                         break
                     if nav_attempt == 0:
-                        logger.warning(f"[批量] 第{expected_ep}集导航第1次失败，10s后重试...")
+                        logger.warning(f"[批量] 第{expected_ep}集搜索重定位第1次失败，10s后重试...")
                         time.sleep(10)
 
                 if not nav_ok:
@@ -1570,53 +2147,34 @@ def main() -> None:
                     break
                 time.sleep(3)
 
-                logger.info(f"\nWaiting for episode {expected_ep} data... ({downloaded}/{max_eps})")
+                logger.info(f"\n[批量] 等待搜索兜底后的第{expected_ep}集数据...")
                 if not wait_for_capture():
-                    # 预缓冲死锁恢复：先跳回 N-1，再重新跳到 N，强制 app 重新触发 setVideoModel
-                    prev_ep = expected_ep - 1
-                    if prev_ep >= 1:
-                        logger.warning(
-                            f"  [恢复] 第{expected_ep}集超时，尝试 N-1→N 恢复策略..."
-                        )
-                        state.clear()
-                        logger.info(f"  [恢复] 1/4 导航到第{prev_ep}集...")
-                        select_episode_from_ui(prev_ep)
-                        time.sleep(3)
-                        state.clear()
-                        logger.info(f"  [恢复] 2/4 再次导航到第{expected_ep}集...")
-                        select_episode_from_ui(expected_ep)
-                        time.sleep(3)
-                        logger.info(f"  [恢复] 3/4 重新等待第{expected_ep}集数据...")
-                        if not wait_for_capture():
-                            logger.error(
-                                f"  [恢复] 4/4 第{expected_ep}集再次超时，退出批量模式"
-                            )
-                            break
-                        logger.info(f"  [恢复] 4/4 第{expected_ep}集数据已捕获！")
-                    else:
-                        logger.info("Timed out waiting for capture, leaving batch mode")
-                        break
-
-                result = download_and_decrypt(expected_ep)
-                if result.get("success"):
-                    downloaded += 1
-                    current_ep = result.get("episode", expected_ep)
-                    # 保留 total_eps，不要用 None 覆盖
-                    new_total = result.get("total_episodes")
-                    if new_total:
-                        total_eps = new_total
-                    if total_eps and current_ep >= total_eps:
-                        logger.info(f"已到达最后一集（共{total_eps}集），停止下载")
-                        break
-                else:
-                    reason = result.get('reason', 'unknown_error')
-                    if reason == 'duplicate_video_id':
-                        logger.warning(f"  第{expected_ep}集视频重复（可能预加载缓存），跳过继续")
-                        current_ep = expected_ep
-                        downloaded += 1
-                        continue
-                    logger.error(f"Episode {expected_ep} failed: {reason}")
+                    logger.error(f"[批量] 第{expected_ep}集在搜索兜底后仍未捕获到数据，退出批量模式")
                     break
+
+                handled, should_break, last_reason = handle_episode_result(
+                    download_and_decrypt(expected_ep),
+                    expected_ep,
+                    allow_duplicate_skip=False,
+                )
+                if should_break:
+                    break
+                if handled:
+                    continue
+                saw_end_signal = last_reason in {"title_mismatch", "episode_not_ascending", "missing_episode"}
+                if total_eps is None and saw_end_signal:
+                    if register_recovery_failure(task_state, True):
+                        logger.info("连续两轮结束信号且恢复失败，停止下载")
+                        break
+                    logger.warning(
+                        f"[批量] 第{expected_ep}集结束信号仅出现一次，回到第{current_ep}集继续重试下一轮"
+                    )
+                    state.clear()
+                    time.sleep(2)
+                    continue
+                register_recovery_failure(task_state, False)
+                logger.error(f"Episode {expected_ep} failed after full recovery chain: {last_reason}")
+                break
         except KeyboardInterrupt:
             logger.info("\nUser interrupted, leaving batch mode")
 
@@ -1626,7 +2184,11 @@ def main() -> None:
         pass
 
     logger.info(f"\n{'=' * 55}")
-    logger.info(f"  全部完成! 共下载 {current_ep - args.episode + 1} 集")
+    completed_from_start = max(
+        0,
+        (task_state.last_confirmed_episode or task_state.start_episode) - task_state.start_episode + 1,
+    )
+    logger.info(f"  全部完成! 共完成 {completed_from_start} 集")
     logger.info(f"  剧名: {drama_name}")
     logger.info(f"  目录: {output_dir or output_root}")
     logger.info(f"{'=' * 55}")
