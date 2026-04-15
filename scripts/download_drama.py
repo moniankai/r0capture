@@ -317,6 +317,62 @@ def reset_capture_state():
     _global_capture_state = CaptureState()
 
 
+def wait_for_ui_stable(
+    expected_ep: int,
+    timeout: float = 10.0,
+    poll_interval: float = 0.5
+) -> bool:
+    """等待 UI 稳定（集数匹配预期）
+
+    用于解决 UI lag 问题：选集后 UI 可能延迟更新，导致读取到旧的集数信息。
+    此函数轮询 UI 直到显示的集数与预期一致，或超时。
+
+    Args:
+        expected_ep: 预期的集数
+        timeout: 超时时间（秒）
+        poll_interval: 轮询间隔（秒）
+
+    Returns:
+        bool: True 表示 UI 已稳定且集数匹配，False 表示超时或解析失败
+    """
+    start_time = time.time()
+    attempts = 0
+
+    while time.time() - start_time < timeout:
+        attempts += 1
+
+        # 解析当前 UI 状态
+        ui_ctx = detect_ui_context_from_device()
+
+        if ui_ctx is None:
+            logger.debug(f"[UI稳定性] 第 {attempts} 次尝试：UI 解析失败，继续等待...")
+            time.sleep(poll_interval)
+            continue
+
+        current_ep = ui_ctx.episode
+
+        if current_ep == expected_ep:
+            elapsed = time.time() - start_time
+            logger.info(
+                f"[UI稳定性] ✓ UI 已稳定：当前集数 {current_ep} 匹配预期 {expected_ep} "
+                f"（耗时 {elapsed:.1f}s，{attempts} 次尝试）"
+            )
+            return True
+        else:
+            logger.debug(
+                f"[UI稳定性] 第 {attempts} 次尝试：当前集数 {current_ep}，"
+                f"预期 {expected_ep}，继续等待..."
+            )
+            time.sleep(poll_interval)
+
+    # 超时
+    logger.warning(
+        f"[UI稳定性] ✗ 超时：UI 集数未匹配预期 {expected_ep} "
+        f"（超时 {timeout}s，{attempts} 次尝试）"
+    )
+    return False
+
+
 @dataclass
 class DownloadTaskState:
     target_title: str
