@@ -37,8 +37,9 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Dict, Optional
 
 import frida
 import requests
@@ -67,6 +68,25 @@ from scripts.drama_download_common import (
 APP_PACKAGE = "com.phoenix.read"
 
 # 组合 Frida Hook：Java 层 TTVideoEngine URL + Native 层 av_aes_init key
+@dataclass
+class VideoRef:
+    """视频引用数据（从 Java Hook 捕获）"""
+    video_id: str
+    duration: int
+    raw_data: Dict[str, Any]
+    timestamp: float = 0.0  # 捕获时间戳（Unix 时间）
+    context: Dict[str, Any] = field(default_factory=dict)  # 上下文信息（预留）
+
+
+@dataclass
+class AESKey:
+    """AES 解密密钥（从 Native Hook 捕获）"""
+    key_hex: str
+    bits: int
+    timestamp: float = 0.0  # 捕获时间戳（Unix 时间）
+    context: Dict[str, Any] = field(default_factory=dict)  # 上下文信息（预留）
+
+
 COMBINED_HOOK = r"""
 var resolver = new ApiResolver("module");
 var ffmpegLoaded = false;
@@ -201,8 +221,8 @@ send({t: "ready"});
 class CaptureState:
     def __init__(self) -> None:
         self.video_urls: list[dict] = []
-        self.aes_keys: list[str] = []
-        self.video_refs: list[dict] = []
+        self.aes_keys: list[AESKey] = []  # 改为使用 AESKey 数据类
+        self.video_refs: list[VideoRef] = []  # 改为使用 VideoRef 数据类
         self.video_models: list[dict] = []
         self.drama_title: str = ""
         self.captured_episodes: dict[str, int] = {}  # video_id → 集号（从 Hook 数据提取）
