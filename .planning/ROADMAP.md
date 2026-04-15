@@ -47,7 +47,7 @@ Plans:
 **Plans**: 3 plans in 3 waves
 
 Plans:
-- [ ] 02-01-PLAN.md — Hook 端增加 episode_number 字段（Java + Native）
+- [x] 02-01-PLAN.md — Hook 端增加 episode_number 字段（Java + Native）
 - [ ] 02-02-PLAN.md — Python 端精确匹配逻辑
 - [ ] 02-03-PLAN.md — 集成测试和真实设备验证
 
