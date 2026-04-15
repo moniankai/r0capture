@@ -291,6 +291,13 @@ class CaptureState:
         self.capture_round = 0
         self.lock = threading.Lock()
 
+        # 数据选择统计（新增）
+        self.match_stats = {
+            "exact_match": 0,      # 精确匹配成功次数
+            "fallback_timestamp": 0,  # 回退到时序选择次数
+            "partial_match": 0,    # 部分匹配次数
+        }
+
     def clear(self) -> None:
         with self.lock:
             self.video_urls.clear()
@@ -299,6 +306,7 @@ class CaptureState:
             self.video_models.clear()
             self.captured_episodes.clear()
             self.capture_round += 1
+            # 注意：不清理 match_stats（跨轮次累积）
 
     @property
     def has_data(self) -> bool:
@@ -2094,23 +2102,65 @@ def main() -> None:
             time.sleep(2)
             return {"success": False, "reason": "stale_key"}
 
-        # 使用最新的数据（按时间戳排序，取最新）
-        _snap_refs = sorted(recent_refs, key=lambda r: r.timestamp, reverse=True)
-        _snap_keys = sorted(recent_keys, key=lambda k: k.timestamp, reverse=True)
+        # 策略 1: 精确匹配 episode_number（优先）
+        matched_refs = [r for r in recent_refs if r.episode_number == ep_num]
+        matched_keys = [k for k in recent_keys if k.episode_number == ep_num]
 
-        logger.info(
-            f"[下载] 使用 Hook 数据: video_id={_snap_refs[0].video_id[:8]}..., "
-            f"age={now - _snap_refs[0].timestamp:.1f}s, "
-            f"key_age={now - _snap_keys[0].timestamp:.1f}s"
-        )
+        vid_ref = None
+        aes_key = None
 
-        if not _snap_keys:
-            logger.error("Missing AES key")
-            return {"success": False, "reason": "missing_key"}
+        if matched_refs and matched_keys:
+            # 精确匹配成功
+            state.match_stats["exact_match"] += 1
+            logger.info(
+                f"[数据选择] ✓ 精确匹配 episode_number={ep_num} "
+                f"(refs={len(matched_refs)}, keys={len(matched_keys)})"
+            )
 
-        # 取第一个捕获的视频 ref：picker 选集后先触发目标集，后触发下一集预加载。
-        # 用 [-1] 会错误选中预加载集，用 [0] 始终选中我们显式选择的目标集。
-        vid = _snap_refs[0].video_id if _snap_refs else "unknown"
+            # 选择最新的数据（按时间戳排序）
+            vid_ref = sorted(matched_refs, key=lambda r: r.timestamp, reverse=True)[0]
+            aes_key = sorted(matched_keys, key=lambda k: k.timestamp, reverse=True)[0]
+
+            logger.debug(
+                f"[数据选择] 选中 video_id={vid_ref.video_id[:8]}... "
+                f"key={aes_key.key_hex[:8]}... (age={now - vid_ref.timestamp:.1f}s)"
+            )
+
+        elif matched_refs or matched_keys:
+            # 部分匹配（仅 refs 或仅 keys 匹配）
+            state.match_stats["partial_match"] += 1
+            logger.warning(
+                f"[数据选择] ⚠ 部分匹配 episode_number={ep_num} "
+                f"(refs={len(matched_refs)}, keys={len(matched_keys)})，回退到时序选择"
+            )
+
+        else:
+            # 无精确匹配，回退到时序选择
+            logger.info(
+                f"[数据选择] episode_number 不可用或无匹配，回退到时序选择 "
+                f"(recent_refs={len(recent_refs)}, recent_keys={len(recent_keys)})"
+            )
+
+        # 策略 2: 时序选择（回退）
+        if vid_ref is None:
+            state.match_stats["fallback_timestamp"] += 1
+            # 选择最新的数据
+            vid_ref = sorted(recent_refs, key=lambda r: r.timestamp, reverse=True)[0]
+            logger.info(
+                f"[数据选择] 时序选择 video_id={vid_ref.video_id[:8]}... "
+                f"(age={now - vid_ref.timestamp:.1f}s)"
+            )
+
+        if aes_key is None:
+            # 选择最新的密钥
+            aes_key = sorted(recent_keys, key=lambda k: k.timestamp, reverse=True)[0]
+            logger.info(
+                f"[数据选择] 时序选择 key={aes_key.key_hex[:8]}... "
+                f"(age={now - aes_key.timestamp:.1f}s)"
+            )
+
+        # 使用选中的数据
+        vid = vid_ref.video_id
         _hook_ep = _snap_episodes.get(vid)
         actual_episode, episode_source = resolve_actual_episode(
             ui_episode=ui_context.episode,
@@ -2183,8 +2233,8 @@ def main() -> None:
 
         if episode_source == "hook":
             logger.info(f"[集号] UI 未检测到集号，使用 Hook 捕获值: 第{actual_episode}集 (vid={vid})")
-        # 同理，取第一个 key：对应第一个（目标集）而非预加载集的密钥。
-        key_hex = _snap_keys[0].key_hex
+        # 使用精确匹配或时序选择的密钥
+        key_hex = aes_key.key_hex
 
         best = state.best_video(args.quality, video_id=vid)
         if not best:
@@ -2474,6 +2524,18 @@ def main() -> None:
         session.detach()
     except Exception:
         pass
+
+    # 批量下载结束，输出统计
+    if state.match_stats["exact_match"] + state.match_stats["fallback_timestamp"] > 0:
+        total = sum(state.match_stats.values())
+        exact_rate = state.match_stats["exact_match"] / total * 100 if total > 0 else 0
+
+        logger.info(
+            f"\n[统计] 数据选择策略分布:\n"
+            f"  - 精确匹配: {state.match_stats['exact_match']} ({exact_rate:.1f}%)\n"
+            f"  - 时序选择: {state.match_stats['fallback_timestamp']}\n"
+            f"  - 部分匹配: {state.match_stats['partial_match']}"
+        )
 
     logger.info(f"\n{'=' * 55}")
     completed_from_start = max(
