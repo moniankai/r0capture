@@ -1879,13 +1879,54 @@ def main() -> None:
             _snap_keys = list(state.aes_keys)
             _snap_episodes = dict(state.captured_episodes)
 
+        # 过滤最近 5 秒内的数据（防止使用过期的预加载数据）
+        now = time.time()
+        FRESHNESS_THRESHOLD = 5.0  # 秒
+
+        recent_refs = [
+            r for r in _snap_refs
+            if now - r.timestamp < FRESHNESS_THRESHOLD
+        ]
+        recent_keys = [
+            k for k in _snap_keys
+            if now - k.timestamp < FRESHNESS_THRESHOLD
+        ]
+
+        if not recent_refs:
+            stale_count = len(_snap_refs)
+            logger.warning(
+                f"[下载] 无最近的 Hook 数据（{stale_count} 个过期数据被丢弃），"
+                "等待重新捕获..."
+            )
+            time.sleep(2)
+            return {"success": False, "reason": "stale_data"}
+
+        if not recent_keys:
+            stale_count = len(_snap_keys)
+            logger.warning(
+                f"[下载] 无最近的 AES 密钥（{stale_count} 个过期密钥被丢弃），"
+                "等待重新捕获..."
+            )
+            time.sleep(2)
+            return {"success": False, "reason": "stale_key"}
+
+        # 使用最新的数据（按时间戳排序，取最新）
+        _snap_refs = sorted(recent_refs, key=lambda r: r.timestamp, reverse=True)
+        _snap_keys = sorted(recent_keys, key=lambda k: k.timestamp, reverse=True)
+
+        logger.info(
+            f"[下载] 使用 Hook 数据: video_id={_snap_refs[0].video_id[:8]}..., "
+            f"age={now - _snap_refs[0].timestamp:.1f}s, "
+            f"key_age={now - _snap_keys[0].timestamp:.1f}s"
+        )
+
         if not _snap_keys:
             logger.error("Missing AES key")
             return {"success": False, "reason": "missing_key"}
 
         # 取第一个捕获的视频 ref：picker 选集后先触发目标集，后触发下一集预加载。
         # 用 [-1] 会错误选中预加载集，用 [0] 始终选中我们显式选择的目标集。
-        vid = _snap_refs[0].get("mVideoId", "unknown") if _snap_refs else "unknown"
+        vid = _snap_refs[0].video_id if _snap_refs else "unknown"
         _hook_ep = _snap_episodes.get(vid)
         actual_episode, episode_source = resolve_actual_episode(
             ui_episode=ui_context.episode,
@@ -1953,7 +1994,7 @@ def main() -> None:
         if episode_source == "hook":
             logger.info(f"[集号] UI 未检测到集号，使用 Hook 捕获值: 第{actual_episode}集 (vid={vid})")
         # 同理，取第一个 key：对应第一个（目标集）而非预加载集的密钥。
-        key_hex = _snap_keys[0]
+        key_hex = _snap_keys[0].key_hex
 
         best = state.best_video(args.quality, video_id=vid)
         if not best:
