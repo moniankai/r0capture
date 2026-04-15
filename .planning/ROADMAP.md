@@ -44,11 +44,12 @@ Plans:
   1. 当目标集和 preload 集的 Hook 同时触发时，Python 端能根据 episode_number 精确选择正确的数据
   2. Hook 数据包含时间戳，Python 端只接受最近 5 秒内的数据（过期数据自动丢弃）
   3. 在多集预加载场景下，AES 密钥与 video_id 能通过 episode_number 准确关联（无错配）
-**Plans**: TBD
+**Plans**: 3 plans in 3 waves
 
 Plans:
-- [ ] 02-01: TBD
-- [ ] 02-02: TBD
+- [ ] 02-01-PLAN.md — Hook 端增加 episode_number 字段（Java + Native）
+- [ ] 02-02-PLAN.md — Python 端精确匹配逻辑
+- [ ] 02-03-PLAN.md — 集成测试和真实设备验证
 
 ### Phase 3: 错误恢复机制改进
 **Goal**: 提升长时间批量下载的可靠性，支持断点续传和自动重试
@@ -85,7 +86,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. 核心稳定性修复 | 0/4 | Ready to execute | - |
-| 2. Hook 数据校验增强 | 0/2 | Not started | - |
+| 1. 核心稳定性修复 | 4/4 | Complete | 2026-04-15 |
+| 2. Hook 数据校验增强 | 0/3 | Ready to execute | - |
 | 3. 错误恢复机制改进 | 0/2 | Not started | - |
 | 4. AppAdapter 抽象 | 0/2 | Not started | - |
