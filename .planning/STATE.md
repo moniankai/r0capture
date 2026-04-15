@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: verifying
-stopped_at: Completed 02-hook-validation-01-PLAN.md
-last_updated: "2026-04-15T15:53:18.032Z"
+stopped_at: Completed 02-hook-validation-02-PLAN.md
+last_updated: "2026-04-15T16:03:10.160Z"
 last_activity: 2026-04-15
 progress:
   total_phases: 4
   completed_phases: 1
   total_plans: 7
-  completed_plans: 5
-  percent: 71
+  completed_plans: 6
+  percent: 86
 ---
 
 # Project State
@@ -54,6 +54,7 @@ Progress: [███████░░░] 75%
 *Updated after each plan completion*
 | Phase 01-core-stability P04 | 3 | 4 tasks | 4 files |
 | Phase 02-hook-validation P01 | 4 | 3 tasks | 1 files |
+| Phase 02 P02 | 5 | 3 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -71,6 +72,8 @@ Recent decisions affecting current work:
 - [Phase 01-core-stability]: 使用 unittest.mock.patch 模拟外部依赖以隔离测试环境
 - [Phase 02-hook-validation]: 使用字段层次搜索策略提取 episode_number，沿继承链查找 VideoModel 字段
 - [Phase 02-hook-validation]: Native Hook 使用全局变量缓存 episode_number，实现 AES 密钥与集数的近似关联
+- [Phase 02]: 精确匹配优先，时序选择回退，确保向后兼容
+- [Phase 02]: 部分匹配强制回退到时序选择，避免 video_id 与 key 错配
 
 ### Pending Todos
 
@@ -100,6 +103,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-04-15T15:53:18.026Z
-Stopped at: Completed 02-hook-validation-01-PLAN.md
+Last session: 2026-04-15T16:03:10.155Z
+Stopped at: Completed 02-hook-validation-02-PLAN.md
 Resume file: None
