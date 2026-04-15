@@ -1248,12 +1248,21 @@ def choose_search_result_bounds(xml_text: str, name: str) -> tuple[int, int, int
     return candidates[0][1]
 
 
-def _try_start_episode_on_drama_page(ep_num: int, clear_state_fn=None) -> bool:
+def _try_start_episode_on_drama_page(ep_num: int, state: Optional[CaptureState] = None) -> bool:
     """进入短剧详情页或选集页后，点击目标集。
+
+    Args:
+        ep_num: 目标集数
+        state: 可选的 CaptureState 实例（测试时注入，生产环境使用全局单例）
+
+    Returns:
+        bool: 是否成功启动
 
     如果已经在播放器页（会自动播放），或成功点击集数按钮触发播放，则返回 True。
     如果页面既不像播放器页也不像选集页，则返回 False。
     """
+    if state is None:
+        state = get_capture_state()
     import xml.etree.ElementTree as _ET
 
     xml_text = read_ui_xml_from_device()
@@ -1305,8 +1314,7 @@ def _try_start_episode_on_drama_page(ep_num: int, clear_state_fn=None) -> bool:
         logger.info(f'[搜索] 在播放器中直接打开选集面板，切换到第 {ep_num} 集')
         # 搜索后 App 会自动播放"续播"集（非目标集），Hook 已将其写入 state。
         # 点击 picker 前清空 state，确保 _snap_refs[0] 是目标集而非续播集。
-        if clear_state_fn:
-            clear_state_fn()
+        reset_capture_state()
         if not select_episode_from_ui(ep_num):
             logger.error(f"[搜索] 选集面板未能切换到第 {ep_num} 集")
             return False
@@ -1322,8 +1330,7 @@ def _try_start_episode_on_drama_page(ep_num: int, clear_state_fn=None) -> bool:
                 bounds_str = elem.attrib.get('bounds', '')
                 m = re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', bounds_str)
                 if m:
-                    if clear_state_fn:
-                        clear_state_fn()  # 清除搜索自动播放污染的 state；点击后 Hook 重新填入目标集数据
+                    reset_capture_state()  # 清除搜索自动播放污染的 state；点击后 Hook 重新填入目标集数据
                     tap_bounds(tuple(int(p) for p in m.groups()))
                     logger.info(f"[搜索] 已在剧情详情页点击第 {ep_num} 集")
                     time.sleep(2.5)
@@ -1343,8 +1350,7 @@ def _try_start_episode_on_drama_page(ep_num: int, clear_state_fn=None) -> bool:
         if xml_text:
             bounds = _find_episode_button(xml_text, ep_num)
             if bounds:
-                if clear_state_fn:
-                    clear_state_fn()  # 清除搜索自动播放污染的 state
+                reset_capture_state()  # 清除搜索自动播放污染的 state
                 tap_bounds(bounds)
                 logger.info(f"[搜索] 已切换范围并点击第 {ep_num} 集")
                 time.sleep(2.5)
@@ -1364,8 +1370,16 @@ def _try_start_episode_on_drama_page(ep_num: int, clear_state_fn=None) -> bool:
     return False
 
 
-def search_drama_in_app(name: str, start_episode: int = 1, clear_state_fn=None) -> bool:
+def search_drama_in_app(name: str, start_episode: int = 1, state: Optional[CaptureState] = None) -> bool:
     """在红果 App 内按剧名搜索，并导航到目标剧集。
+
+    Args:
+        name: 短剧名称
+        start_episode: 起始集数
+        state: 可选的 CaptureState 实例（测试时注入，生产环境使用全局单例）
+
+    Returns:
+        bool: 是否成功打开短剧
 
     策略（每步都有主路径和回退路径）：
       1. 通过 deeplink ``dragon8662://search`` 打开搜索页；
@@ -1377,6 +1391,9 @@ def search_drama_in_app(name: str, start_episode: int = 1, clear_state_fn=None) 
 
     成功返回 True，失败返回 False。
     """
+    if state is None:
+        state = get_capture_state()
+
     logger.info(f"\n[搜索] ===== 自动搜索: 《{name}》 =====")
 
     # ---- 步骤 1：打开搜索页 ----
@@ -1652,10 +1669,17 @@ def main() -> None:
                 logger.info(f"[Hook] 检测到集号: 第{_ep_from_hook}集 (vid={_vid_for_ep})")
         elif t == "video_ref":
             vid = p["data"].get("mVideoId", "?")
-            dur = p["data"].get("mVideoDuration", "?")
+            dur = p["data"].get("mVideoDuration", 0)
             logger.info(f"[捕获] 视频: {vid} ({dur}s)")
             with state.lock:
-                state.video_refs.append(p["data"])
+                ref = VideoRef(
+                    video_id=vid,
+                    duration=dur if isinstance(dur, int) else 0,
+                    raw_data=p["data"],
+                    timestamp=time.time(),  # 记录捕获时间戳
+                    context={}
+                )
+                state.video_refs.append(ref)
                 state._current_video_id = vid
         elif t == "video_info":
             d = p["data"]
@@ -1676,10 +1700,18 @@ def main() -> None:
             logger.info(f"  [{p['idx']}] {res} kid={kid[:16]}...")
         elif t == "AES_KEY":
             key = p["key"]
+            bits = p.get("bits", 128)
             with state.lock:
-                if key not in state.aes_keys:
-                    state.aes_keys.append(key)
-            logger.info(f"  >>> AES KEY: {key} ({p['bits']}bit)")
+                # 检查是否已存在相同密钥（避免重复）
+                if not any(k.key_hex == key for k in state.aes_keys):
+                    aes_key = AESKey(
+                        key_hex=key,
+                        bits=bits,
+                        timestamp=time.time(),  # 记录捕获时间戳
+                        context={}
+                    )
+                    state.aes_keys.append(aes_key)
+            logger.info(f"  >>> AES KEY: {key} ({bits}bit)")
 
     # output_dir 在首次捕获后解析，因为 drama_name 可能需要自动识别
     output_dir = ""
