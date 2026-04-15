@@ -33,8 +33,8 @@ Decimal phases appear between their surrounding integers in numeric order.
 Plans:
 - [x] 01-01-PLAN.md — 状态管理重构（模块级单例）
 - [x] 01-02-PLAN.md — Hook 数据结构增强（时间戳字段）
-- [ ] 01-03-PLAN.md — UI 稳定性检查（两阶段模式）
-- [ ] 01-04-PLAN.md — 测试覆盖和回归验证
+- [x] 01-03-PLAN.md — UI 稳定性检查（两阶段模式）
+- [x] 01-04-PLAN.md — 测试覆盖和回归验证
 
 ### Phase 2: Hook 数据校验增强
 **Goal**: 通过增加上下文信息，消除 Hook 数据竞争和时序依赖

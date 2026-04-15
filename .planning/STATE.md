@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
-stopped_at: Completed 01-core-stability-03-PLAN.md
-last_updated: "2026-04-15T15:19:00.000Z"
+status: verifying
+stopped_at: Completed 01-core-stability-04-PLAN.md
+last_updated: "2026-04-15T15:26:08.063Z"
 last_activity: 2026-04-15
 progress:
   total_phases: 4
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 4
-  completed_plans: 3
-  percent: 75
+  completed_plans: 4
+  percent: 100
 ---
 
 # Project State
@@ -27,7 +27,7 @@ See: .planning/PROJECT.md (updated 2026-04-15)
 
 Phase: 1 of 4 (核心稳定性修复)
 Plan: 3 of 3 in current phase
-Status: Phase 1 completed
+Status: Phase complete — ready for verification
 Last activity: 2026-04-15
 
 Progress: [███████░░░] 75%
@@ -52,6 +52,7 @@ Progress: [███████░░░] 75%
 - Trend: Improving (execution time decreasing)
 
 *Updated after each plan completion*
+| Phase 01-core-stability P04 | 3 | 4 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -65,6 +66,8 @@ Recent decisions affecting current work:
 - [Phase 01-core-stability]: 移除 should_accept_out_of_order_episode 的自动覆盖
 - [Phase 01-core-stability]: 使用 5 秒作为 Hook 数据新鲜度阈值，平衡数据时效性和 UI 延迟容忍度
 - [Phase 01-core-stability]: 使用懒加载单例模式 + 可选依赖注入，平衡便利性和测试友好性
+- [Phase 01-core-stability]: 将 wait_for_ui_stable 提升为模块级函数以支持测试导入
+- [Phase 01-core-stability]: 使用 unittest.mock.patch 模拟外部依赖以隔离测试环境
 
 ### Pending Todos
 
@@ -94,6 +97,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-04-15T15:13:15.580Z
-Stopped at: Completed 01-core-stability-01-PLAN.md
+Last session: 2026-04-15T15:26:08.057Z
+Stopped at: Completed 01-core-stability-04-PLAN.md
 Resume file: None
