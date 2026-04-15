@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 01-core-stability-02-PLAN.md
-last_updated: "2026-04-15T15:10:47.783Z"
+stopped_at: Completed 01-core-stability-01-PLAN.md
+last_updated: "2026-04-15T15:13:15.587Z"
 last_activity: 2026-04-15
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 4
-  completed_plans: 1
-  percent: 25
+  completed_plans: 2
+  percent: 50
 ---
 
 # Project State
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-04-15)
 ## Current Position
 
 Phase: 1 of 4 (核心稳定性修复)
-Plan: 1 of 2 in current phase
+Plan: 2 of 2 in current phase
 Status: Ready to execute
 Last activity: 2026-04-15
 
@@ -53,6 +53,7 @@ Progress: [░░░░░░░░░░] 0%
 
 *Updated after each plan completion*
 | Phase 01-core-stability P02 | 6 | 3 tasks | 1 files |
+| Phase 01-core-stability P01 | 8 | 3 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -63,6 +64,7 @@ Recent decisions affecting current work:
 
 - (project just initialized)
 - [Phase 01-core-stability]: 使用 5 秒作为 Hook 数据新鲜度阈值，平衡数据时效性和 UI 延迟容忍度
+- [Phase 01-core-stability]: 使用懒加载单例模式 + 可选依赖注入，平衡便利性和测试友好性
 
 ### Pending Todos
 
@@ -92,6 +94,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-04-15T15:10:47.778Z
-Stopped at: Completed 01-core-stability-02-PLAN.md
+Last session: 2026-04-15T15:13:15.580Z
+Stopped at: Completed 01-core-stability-01-PLAN.md
 Resume file: None
