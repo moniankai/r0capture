@@ -1360,8 +1360,7 @@ def _try_start_episode_on_drama_page(ep_num: int, state: Optional[CaptureState] 
     for play_text in ('立即播放', '继续播放', '播放'):
         b = find_text_bounds(xml_text, play_text)
         if b and b[1] > 150:
-            if clear_state_fn:
-                clear_state_fn()  # 清除搜索自动播放污染的 state
+            reset_capture_state()  # 清除搜索自动播放污染的 state
             tap_bounds(b)
             logger.info(f"[搜索] 已点击 '{play_text}' 按钮")
             time.sleep(2.5)
@@ -1527,13 +1526,12 @@ def search_drama_in_app(name: str, start_episode: int = 1, state: Optional[Captu
 
     # ---- 步骤 6：开始播放目标集 ----
     # 短剧详情页不会自动播放，必须显式点击集数按钮。
-    if not _try_start_episode_on_drama_page(start_episode, clear_state_fn=clear_state_fn):
+    if not _try_start_episode_on_drama_page(start_episode):
         # 回退方案：_try_start_episode_on_drama_page 未能导航时，
         # 无论目标集是否为第1集，都通过选集面板强制跳集。
         # 注意：之前此处有 `if start_episode > 1` 守卫，导致第1集时跳过了导航，
         # App 续播直接进入播放器后控制层隐藏，脚本无法确认集号，捕获超时。
-        if clear_state_fn:
-            clear_state_fn()  # 回退路径：picker 直接选集前也要清空 state
+        reset_capture_state()  # 回退路径：picker 直接选集前也要清空 state
         if not select_episode_from_ui(start_episode):
             logger.warning(f"[搜索] 无法自动选集，请手动选择第 {start_episode} 集")
 
@@ -1809,7 +1807,7 @@ def main() -> None:
         time.sleep(wait_time)
         state.clear()
         logger.info("  已清除启动数据，开始自动搜索...")
-        search_ok = search_drama_in_app(args.name, start_episode=planned_start_episode, clear_state_fn=state.clear)
+        search_ok = search_drama_in_app(args.name, start_episode=planned_start_episode)
         if not search_ok:
             logger.warning("  自动搜索失败，请手动在手机上打开目标剧集，脚本将继续等待")
     elif args.skip_initial > 0:
@@ -2080,7 +2078,7 @@ def main() -> None:
         logger.warning("启动轮次未落到目标剧/目标集；清空捕获并重新定位。")
         state.clear()
         if args.search and expected_drama_name:
-            search_drama_in_app(expected_drama_name, current_ep, clear_state_fn=state.clear)
+            search_drama_in_app(expected_drama_name, current_ep)
         if not wait_for_capture():
             break
         first_result = download_and_decrypt(current_ep)
@@ -2187,7 +2185,7 @@ def main() -> None:
                 state.clear()
                 nav_ok = False
                 for nav_attempt in range(2):
-                    nav_ok = search_drama_in_app(drama_name, expected_ep, clear_state_fn=state.clear)
+                    nav_ok = search_drama_in_app(drama_name, expected_ep)
                     if nav_ok:
                         break
                     if nav_attempt == 0:
