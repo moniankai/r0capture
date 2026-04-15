@@ -1829,6 +1829,61 @@ def main() -> None:
     task_state.first_missing_episode = current_ep
     task_state.current_episode = current_ep
 
+    def wait_for_ui_stable(
+        expected_ep: int,
+        timeout: float = 10.0,
+        poll_interval: float = 0.5
+    ) -> bool:
+        """等待 UI 稳定（集数匹配预期）
+
+        用于解决 UI lag 问题：选集后 UI 可能延迟更新，导致读取到旧的集数信息。
+        此函数轮询 UI 直到显示的集数与预期一致，或超时。
+
+        Args:
+            expected_ep: 预期的集数
+            timeout: 超时时间（秒）
+            poll_interval: 轮询间隔（秒）
+
+        Returns:
+            bool: True 表示 UI 已稳定且集数匹配，False 表示超时或解析失败
+        """
+        start_time = time.time()
+        attempts = 0
+
+        while time.time() - start_time < timeout:
+            attempts += 1
+
+            # 解析当前 UI 状态
+            ui_ctx = detect_ui_context_from_device()
+
+            if ui_ctx is None:
+                logger.debug(f"[UI稳定性] 第 {attempts} 次尝试：UI 解析失败，继续等待...")
+                time.sleep(poll_interval)
+                continue
+
+            current_ep = ui_ctx.episode
+
+            if current_ep == expected_ep:
+                elapsed = time.time() - start_time
+                logger.info(
+                    f"[UI稳定性] ✓ UI 已稳定：当前集数 {current_ep} 匹配预期 {expected_ep} "
+                    f"（耗时 {elapsed:.1f}s，{attempts} 次尝试）"
+                )
+                return True
+            else:
+                logger.debug(
+                    f"[UI稳定性] 第 {attempts} 次尝试：当前集数 {current_ep}，"
+                    f"预期 {expected_ep}，继续等待..."
+                )
+                time.sleep(poll_interval)
+
+        # 超时
+        logger.warning(
+            f"[UI稳定性] ✗ 超时：UI 集数未匹配预期 {expected_ep} "
+            f"（超时 {timeout}s，{attempts} 次尝试）"
+        )
+        return False
+
     def wait_for_capture(timeout_seconds: int | None = None) -> bool:
         """等待捕获 URL 和 AES key；超时时返回 False。"""
         effective_timeout = timeout_seconds or args.timeout
@@ -1962,15 +2017,21 @@ def main() -> None:
                 output_dir=Path(output_dir) if output_dir else None,
                 drama_name=drama_name,
             ):
-                logger.warning(f"[集号] 实际集号为第{actual_episode}集，当前目标是第{ep_num}集；先按实际缺口集落盘")
-                ep_num = actual_episode
+                # 检测到跳集场景，但不自动覆盖 ep_num
+                # 两阶段模式已确保 UI 稳定，不应出现集数不匹配
+                logger.warning(
+                    f"[集号] 检测到跳集场景：实际集号为第{actual_episode}集，"
+                    f"当前目标是第{ep_num}集。两阶段模式已确保 UI 稳定，"
+                    f"这不应该发生。如需下载第{actual_episode}集，请手动指定 -e {actual_episode}。"
+                )
+                # 不再自动覆盖：ep_num = actual_episode
             else:
                 logger.error(f"[集号] 实际集号为第{actual_episode}集，但当前目标是第{ep_num}集，拒绝落盘")
-                return {
-                    "success": False,
-                    "reason": "unexpected_episode",
-                    "episode": actual_episode,
-                }
+            return {
+                "success": False,
+                "reason": "unexpected_episode",
+                "episode": actual_episode,
+            }
 
         # 把实际 UI 标题传给 validate_round，避免 "18岁" 与 "十八岁" 这类数字形式差异阻塞校验。
         # 标题正确性已在上面的 _titles_match 中验证。
@@ -2189,7 +2250,18 @@ def main() -> None:
             if not select_episode_from_ui(expected_ep):
                 logger.warning(f"[恢复] 选集面板无法跳到第{expected_ep}集")
                 return False, False, "panel_navigation_failed"
-            time.sleep(3)  # 给 UI 足够时间显示新集数
+
+            # 阶段 2: 等待 UI 稳定（替代硬编码的 time.sleep(3)）
+            logger.info(f"[恢复] 等待 UI 更新到第{expected_ep}集...")
+            if not wait_for_ui_stable(expected_ep=expected_ep, timeout=10.0):
+                logger.error(
+                    f"[恢复] UI 未稳定到第{expected_ep}集，可能选集失败或 UI 响应慢，"
+                    "清空 state 并重试"
+                )
+                reset_capture_state()  # 清空可能的脏数据
+                return False, False, "ui_not_stable"
+
+            # 阶段 3: 等待 Hook 数据捕获（此时 UI 已确认是正确集数）
             logger.info(f"[恢复] 等待第{expected_ep}集捕获数据...")
             if not wait_for_capture(timeout_seconds=75):  # 实测选集后 Hook 可能需要 60s+
                 logger.warning(f"[恢复] 第{expected_ep}集在选集恢复后仍未捕获到数据")
