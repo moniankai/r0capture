@@ -412,3 +412,201 @@ def build_plan(output_dir: str, total_eps: int, start_ep: int = 1) -> list[dict]
         else:
             plan.append({"ep": ep, "status": "pending"})
     return plan
+
+
+def download_episode(ep_num: int, state: HookState, output_dir: str, drama_name: str) -> dict:
+    """围栏式单集下载管线
+
+    Returns: {"success": bool, "ep": int, "video_id": str, "reason": str}
+    """
+    MAX_RETRIES = 3
+
+    for attempt in range(MAX_RETRIES):
+        logger.info(f"[第{ep_num}集] 开始下载 (尝试 {attempt + 1}/{MAX_RETRIES})")
+
+        # 1. 设置围栏
+        fence_ts = time.time()
+
+        # 2. 选集
+        ok = select_episode_from_ui(ep_num)
+        if not ok:
+            logger.warning(f"[第{ep_num}集] 选集失败，重试")
+            time.sleep(2)
+            continue
+
+        # 3. 等待 Hook 数据
+        result = wait_capture(state, fence_ts, timeout=30)
+        if result is None:
+            logger.warning(f"[第{ep_num}集] 等待捕获超时，重试")
+            continue
+        ref, url, key = result
+
+        # 4. UI 校验集数
+        ui_ep = read_ui_episode()
+        if ui_ep is not None and ui_ep != ep_num:
+            logger.warning(f"[第{ep_num}集] UI 显示第{ui_ep}集，不一致，重试")
+            continue
+
+        # 5. 下载 + 解密
+        vid8 = ref.video_id[-8:] if len(ref.video_id) >= 8 else ref.video_id
+        output_path = os.path.join(output_dir, f"episode_{ep_num:03d}_{vid8}.mp4")
+
+        ok = download_and_decrypt(url, key.key_hex, output_path)
+        if not ok:
+            logger.warning(f"[第{ep_num}集] 下载/解密失败，重试")
+            continue
+
+        # 6. 验证
+        if not verify_playable(output_path):
+            logger.warning(f"[第{ep_num}集] 验证失败，删除文件并重试")
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            continue
+
+        logger.info(f"[第{ep_num}集] 下载成功: {output_path}")
+        return {
+            "success": True,
+            "ep": ep_num,
+            "video_id": ref.video_id,
+            "path": output_path,
+            "reason": "ok",
+        }
+
+    logger.error(f"[第{ep_num}集] {MAX_RETRIES} 次重试均失败")
+    return {
+        "success": False,
+        "ep": ep_num,
+        "video_id": "",
+        "reason": "max_retries_exceeded",
+    }
+
+
+def recover_frida(state: HookState, drama_name: str) -> tuple:
+    """Frida 断连后完整恢复
+
+    Returns: (session, script, pid)
+    """
+    logger.info("[恢复] Frida session 断开，重新初始化...")
+    state.clear()
+
+    session, script, pid = setup_frida(APP_PACKAGE, state)
+
+    if not navigate_to_offline_cache():
+        logger.error("[恢复] 导航到离线缓存失败")
+        return session, script, pid
+
+    if not enter_drama_from_cache(drama_name):
+        logger.warning("[恢复] 在缓存中找不到剧，尝试搜索入口")
+        try:
+            from scripts.download_drama import search_drama_in_app
+            search_drama_in_app(drama_name)
+        except Exception as e:
+            logger.error(f"[恢复] 搜索入口也失败: {e}")
+
+    return session, script, pid
+
+
+def main():
+    parser = argparse.ArgumentParser(description="红果短剧全集精准下载器")
+    parser.add_argument("-n", "--name", required=True, help="短剧名称")
+    parser.add_argument("-e", "--start-episode", type=int, default=1, help="起始集数")
+    parser.add_argument("--output", default="./videos", help="输出根目录")
+    args = parser.parse_args()
+
+    drama_name = args.name
+    start_ep = args.start_episode
+    output_dir = os.path.join(args.output, drama_name)
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 配置日志
+    log_file = os.path.join(output_dir, "download.log")
+    logger.add(log_file, rotation="10 MB", encoding="utf-8",
+               format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}", level="INFO")
+
+    logger.info(f"{'=' * 60}")
+    logger.info(f"  红果短剧下载器")
+    logger.info(f"  目标: 《{drama_name}》 从第{start_ep}集开始")
+    logger.info(f"  输出: {output_dir}")
+    logger.info(f"{'=' * 60}")
+
+    # 1. 初始化 Frida
+    state = HookState()
+    session, script, pid = setup_frida(APP_PACKAGE, state)
+
+    # 2. 导航到离线缓存
+    logger.info("[1/4] 导航到离线缓存...")
+    cache_ok = navigate_to_offline_cache()
+
+    # 3. 进入剧
+    player_ok = False
+    if cache_ok:
+        logger.info("[2/4] 进入播放器...")
+        player_ok = enter_drama_from_cache(drama_name)
+
+    if not player_ok:
+        logger.warning("[2/4] 离线缓存入口失败，尝试搜索入口...")
+        try:
+            from scripts.download_drama import search_drama_in_app
+            player_ok = search_drama_in_app(drama_name, start_episode=start_ep)
+        except Exception as e:
+            logger.error(f"搜索入口也失败: {e}")
+
+    if not player_ok:
+        logger.error("无法进入播放器，退出")
+        return
+
+    # 4. 获取总集数
+    total_eps = read_ui_total_episodes()
+    if total_eps is None:
+        logger.warning("无法从 UI 获取总集数，使用默认值 60")
+        total_eps = 60
+    logger.info(f"[3/4] 总集数: {total_eps}")
+
+    # 5. 生成下载计划
+    plan = build_plan(output_dir, total_eps, start_ep)
+    done_count = sum(1 for p in plan if p["status"] == "done")
+    pending_count = sum(1 for p in plan if p["status"] == "pending")
+    logger.info(f"[4/4] 下载计划: {pending_count} 集待下载, {done_count} 集已完成")
+
+    # 6. 逐集下载
+    manifest_path = os.path.join(output_dir, "session_manifest.jsonl")
+    success_count = 0
+    failed_eps = []
+
+    for task in tqdm(plan, desc="下载进度"):
+        if task["status"] == "done":
+            continue
+
+        ep_num = task["ep"]
+        try:
+            result = download_episode(ep_num, state, output_dir, drama_name)
+        except frida.InvalidOperationError:
+            logger.warning(f"[第{ep_num}集] Frida session 断开，恢复...")
+            session, script, pid = recover_frida(state, drama_name)
+            result = download_episode(ep_num, state, output_dir, drama_name)
+
+        if result["success"]:
+            success_count += 1
+            append_jsonl(manifest_path, {
+                "episode": result["ep"],
+                "video_id": result["video_id"],
+                "path": result["path"],
+                "timestamp": time.time(),
+                "status": "ok",
+            })
+        else:
+            failed_eps.append(ep_num)
+
+    # 7. 最终报告
+    total_done = done_count + success_count
+    logger.info(f"\n{'=' * 60}")
+    logger.info(f"  下载完成!")
+    logger.info(f"  成功: {total_done}/{total_eps} 集")
+    if failed_eps:
+        logger.warning(f"  失败: {len(failed_eps)} 集 → {failed_eps}")
+    logger.info(f"  输出: {output_dir}")
+    logger.info(f"{'=' * 60}")
+
+
+if __name__ == "__main__":
+    main()
