@@ -2057,16 +2057,35 @@ def main() -> None:
 
     def download_and_decrypt(ep_num: int) -> dict:
         """在 UI 校验后下载并解密当前捕获的视频。"""
+        def _log_to_manifest(status: str, **extra_fields) -> None:
+            """统一记录到 session_manifest.jsonl
+
+            标准字段（所有记录必须包含）：
+            - episode: int — 集数
+            - status: str — 状态
+            - timestamp: float — Unix 时间戳
+
+            可选字段（通过 extra_fields 传入）：
+            - video_id: str — 视频 ID（8 位后缀）
+            - resolution: str — 分辨率
+            - video_path: str — 解密后视频路径
+            - meta_path: str — 元数据文件路径
+            - retry_count: int — 重试次数
+            - reason: str — 失败或跳过原因
+            - error: str | None — 错误信息
+            """
+            record = {
+                "episode": ep_num,
+                "status": status,
+                "timestamp": time.time(),
+                **extra_fields
+            }
+            append_jsonl(session_manifest_path, record)
+
         # 断点续传：检查集数是否已完成
         if ep_num in completed_episodes:
             logger.info(f"[断点续传] 第 {ep_num} 集已完成，跳过")
-            # 记录跳过事件到 session_manifest.jsonl
-            append_jsonl(session_manifest_path, {
-                "episode": ep_num,
-                "status": "skipped_resume",
-                "timestamp": time.time(),
-                "reason": "already_completed"
-            })
+            _log_to_manifest("skipped_resume", reason="already_completed")
             return {"success": True, "reason": "skipped_resume", "episode": ep_num}
 
         ui_context = detect_ui_context_from_device()
@@ -2284,7 +2303,13 @@ def main() -> None:
             logger.info(f"  Episode {actual_episode} already exists, skipping: {dec_path}")
             with open(meta_path, "w", encoding="utf-8") as f:
                 json.dump(meta_payload, f, indent=2, ensure_ascii=False)
-            append_jsonl(session_manifest_path, {**meta_payload, "video_path": dec_path, "meta_path": meta_path, "status": "skipped_existing"})
+            _log_to_manifest(
+                "skipped_existing",
+                video_id=vid,
+                resolution=best["resolution"],
+                video_path=dec_path,
+                meta_path=meta_path
+            )
             # 传入空 video_id，避免把当前捕获 ID 加入 seen_video_ids；
             # 当前捕获的视频可能不同于已存文件。
             apply_valid_round(
@@ -2330,15 +2355,14 @@ def main() -> None:
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta_payload, f, indent=2, ensure_ascii=False)
 
-        append_jsonl(
-            session_manifest_path,
-            {
-                **meta_payload,
-                "video_path": dec_path,
-                "meta_path": meta_path,
-                "status": "downloaded",
-                "sample_count": total,
-            },
+        _log_to_manifest(
+            "downloaded",
+            video_id=vid,
+            resolution=best["resolution"],
+            video_path=dec_path,
+            meta_path=meta_path,
+            retry_count=0,
+            sample_count=total
         )
         apply_valid_round(
             session_state,
@@ -2375,6 +2399,16 @@ def main() -> None:
         """
         nonlocal session_manifest_path
 
+        def _log_retry_to_manifest(status: str, **extra_fields) -> None:
+            """统一记录重试历史到 session_manifest.jsonl"""
+            record = {
+                "episode": ep_num,
+                "status": status,
+                "timestamp": time.time(),
+                **extra_fields
+            }
+            append_jsonl(session_manifest_path, record)
+
         result = {}
         for attempt in range(max_retries):
             if attempt > 0:
@@ -2388,15 +2422,13 @@ def main() -> None:
 
             # 记录重试历史到 session_manifest.jsonl
             if attempt > 0 or not result.get("success", False):
-                append_jsonl(session_manifest_path, {
-                    "episode": ep_num,
-                    "status": "retry_attempt" if not result.get("success", False) else "retry_success",
-                    "attempt": attempt + 1,
-                    "max_retries": max_retries,
-                    "reason": result.get("reason", "unknown"),
-                    "error": result.get("error", None),
-                    "timestamp": time.time()
-                })
+                _log_retry_to_manifest(
+                    "retry_attempt" if not result.get("success", False) else "retry_success",
+                    attempt=attempt + 1,
+                    max_retries=max_retries,
+                    reason=result.get("reason", "unknown"),
+                    error=result.get("error", None)
+                )
 
             # 成功或跳过（skipped_resume）则返回
             if result.get("success", False):
@@ -2405,14 +2437,12 @@ def main() -> None:
             # 最后一次尝试失败，记录最终失败状态
             if attempt == max_retries - 1:
                 logger.error(f"[重试] 第 {ep_num} 集重试 {max_retries} 次后仍失败: {result.get('reason', 'unknown')}")
-                append_jsonl(session_manifest_path, {
-                    "episode": ep_num,
-                    "status": "failed_after_retries",
-                    "max_retries": max_retries,
-                    "final_reason": result.get("reason", "unknown"),
-                    "final_error": result.get("error", None),
-                    "timestamp": time.time()
-                })
+                _log_retry_to_manifest(
+                    "failed_after_retries",
+                    max_retries=max_retries,
+                    final_reason=result.get("reason", "unknown"),
+                    final_error=result.get("error", None)
+                )
 
         return result
 
