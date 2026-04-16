@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest.mock import Mock, patch
 from types import SimpleNamespace
@@ -1069,6 +1070,139 @@ class TestDownloadWithRetry(unittest.TestCase):
         self.assertEqual(result["reason"], "skipped_resume")
         mock_reset.assert_not_called()
         mock_download.assert_called_once()
+
+
+class TestSessionManifestFormat(unittest.TestCase):
+    """测试 session_manifest.jsonl 记录格式的一致性"""
+
+    def test_session_manifest_format_downloaded(self):
+        """测试 downloaded 状态记录包含所有必需字段"""
+        with TemporaryDirectory() as tmpdir:
+            manifest_path = Path(tmpdir) / "session_manifest.jsonl"
+
+            # 模拟 downloaded 状态记录
+            from scripts.drama_download_common import append_jsonl
+            append_jsonl(manifest_path, {
+                "episode": 1,
+                "status": "downloaded",
+                "timestamp": 1713196800.0,
+                "video_id": "abc12345",
+                "resolution": "720p",
+                "video_path": "episode_001_abc12345.mp4",
+                "meta_path": "meta_ep001_abc12345.json",
+                "retry_count": 0
+            })
+
+            # 验证记录格式
+            with manifest_path.open('r', encoding='utf-8') as f:
+                record = json.loads(f.readline())
+
+                # 必需字段
+                self.assertIn("episode", record)
+                self.assertIn("status", record)
+                self.assertIn("timestamp", record)
+                self.assertEqual(record["episode"], 1)
+                self.assertEqual(record["status"], "downloaded")
+
+                # 可选字段
+                self.assertEqual(record["video_id"], "abc12345")
+                self.assertEqual(record["resolution"], "720p")
+                self.assertEqual(record["retry_count"], 0)
+
+    def test_session_manifest_format_skipped_resume(self):
+        """测试 skipped_resume 状态记录格式"""
+        with TemporaryDirectory() as tmpdir:
+            manifest_path = Path(tmpdir) / "session_manifest.jsonl"
+
+            from scripts.drama_download_common import append_jsonl
+            append_jsonl(manifest_path, {
+                "episode": 2,
+                "status": "skipped_resume",
+                "timestamp": 1713196850.0,
+                "reason": "already_completed"
+            })
+
+            with manifest_path.open('r', encoding='utf-8') as f:
+                record = json.loads(f.readline())
+
+                # 必需字段
+                self.assertEqual(record["episode"], 2)
+                self.assertEqual(record["status"], "skipped_resume")
+                self.assertIn("timestamp", record)
+
+                # 可选字段
+                self.assertEqual(record["reason"], "already_completed")
+
+    def test_session_manifest_format_retry_success(self):
+        """测试 retry_success 状态记录包含 retry_count"""
+        with TemporaryDirectory() as tmpdir:
+            manifest_path = Path(tmpdir) / "session_manifest.jsonl"
+
+            from scripts.drama_download_common import append_jsonl
+            append_jsonl(manifest_path, {
+                "episode": 3,
+                "status": "retry_success",
+                "timestamp": 1713196900.0,
+                "attempt": 2,
+                "max_retries": 3,
+                "reason": "unknown",
+                "error": None
+            })
+
+            with manifest_path.open('r', encoding='utf-8') as f:
+                record = json.loads(f.readline())
+
+                # 必需字段
+                self.assertEqual(record["episode"], 3)
+                self.assertEqual(record["status"], "retry_success")
+                self.assertIn("timestamp", record)
+
+                # 重试相关字段
+                self.assertEqual(record["attempt"], 2)
+                self.assertEqual(record["max_retries"], 3)
+
+    def test_session_manifest_backward_compatible(self):
+        """测试 parse_session_manifest() 能解析旧格式记录"""
+        with TemporaryDirectory() as tmpdir:
+            manifest_path = Path(tmpdir) / "session_manifest.jsonl"
+
+            from scripts.drama_download_common import append_jsonl, parse_session_manifest
+
+            # 旧格式记录（包含 meta_payload 的所有字段）
+            append_jsonl(manifest_path, {
+                "drama": "测试剧",
+                "folder_drama": "测试剧",
+                "episode": 1,
+                "ui_total_episodes": 80,
+                "video_id": "abc12345",
+                "resolution": "720p",
+                "codec": "h264",
+                "aes_key": "0123456789abcdef0123456789abcdef",
+                "kid": "",
+                "captured_video_url_count": 1,
+                "captured_key_count": 1,
+                "selected_url": "https://example.com/video.mp4",
+                "timestamp": 1713196800,
+                "video_path": "episode_001_abc12345.mp4",
+                "meta_path": "meta_ep001_abc12345.json",
+                "status": "downloaded"
+            })
+
+            # 新格式记录（只包含标准字段）
+            append_jsonl(manifest_path, {
+                "episode": 2,
+                "status": "downloaded",
+                "timestamp": 1713196850.0,
+                "video_id": "def67890",
+                "resolution": "1080p",
+                "video_path": "episode_002_def67890.mp4",
+                "meta_path": "meta_ep002_def67890.json",
+                "retry_count": 0
+            })
+
+            # 验证 parse_session_manifest 能正确解析两种格式
+            completed = parse_session_manifest(manifest_path)
+            self.assertEqual(completed, {1, 2})
 
 
 if __name__ == "__main__":
