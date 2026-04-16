@@ -64,7 +64,7 @@ Plans:
 Plans:
 - [x] 03-01-PLAN.md — 断点续传机制（读取 session_manifest.jsonl 识别已下载集数）
 - [x] 03-02-PLAN.md — 自动重试机制（max_retries=3，每次重试前清空状态）
-- [ ] 03-03-PLAN.md — 会话持久化增强（标准化记录格式，更新 README）
+- [x] 03-03-PLAN.md — 会话持久化增强（标准化记录格式，更新 README）
 
 ### Phase 4: AppAdapter 抽象
 **Goal**: 建立多 App 支持的架构基础，为扩展到快手、抖音等平台做准备
