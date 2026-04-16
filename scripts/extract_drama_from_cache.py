@@ -2,9 +2,27 @@
 """红果短剧缓存提取与切分主入口脚本"""
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from loguru import logger
+
+# 刷新环境变量（Windows 系统）
+if sys.platform == "win32":
+    import winreg
+    try:
+        # 读取系统和用户的 PATH
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment") as key:
+            machine_path = winreg.QueryValueEx(key, "Path")[0]
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment") as key:
+            try:
+                user_path = winreg.QueryValueEx(key, "Path")[0]
+            except FileNotFoundError:
+                user_path = ""
+        # 更新当前进程的 PATH
+        os.environ["PATH"] = machine_path + ";" + user_path + ";" + os.environ.get("PATH", "")
+    except Exception as e:
+        logger.warning(f"刷新环境变量失败: {e}")
 
 # 添加项目根目录到 sys.path
 sys.path.insert(0, str(Path(__file__).parent.parent))
