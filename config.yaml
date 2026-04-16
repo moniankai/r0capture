@@ -1,0 +1,43 @@
+# 红果短剧下载器配置文件
+# 用于选择目标 App 和自定义行为
+
+# 当前使用的 App（可选值：honguo, kuaishou, douyin）
+app: honguo
+
+# App 特定配置
+apps:
+  honguo:
+    package: com.phoenix.read
+    hook_script: frida_hooks/ttengine_all.js
+    # 可选：自定义 UI 元素定位符（未来扩展）
+    # ui_selectors:
+    #   title_resource_id: com.phoenix.read:id/d4
+    #   episode_resource_id: com.phoenix.read:id/jjj
+
+  # 未来支持的 App（示例）
+  # kuaishou:
+  #   package: com.kuaishou.nebula
+  #   hook_script: frida_hooks/kuaishou_hook.js
+
+  # douyin:
+  #   package: com.ss.android.ugc.aweme
+  #   hook_script: frida_hooks/douyin_hook.js
+
+# 下载配置
+download:
+  # 默认画质（可选值：720p, 1080p, origin）
+  quality: 720p
+
+  # 最大重试次数
+  max_retries: 3
+
+  # 输出目录
+  output_dir: videos
+
+# Frida 配置
+frida:
+  # Frida 版本（必须与设备端 frida-server 匹配）
+  version: 16.5.9
+
+  # 连接超时（秒）
+  timeout: 10
