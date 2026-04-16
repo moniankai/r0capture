@@ -138,7 +138,7 @@ python scripts/download_drama.py -n "爹且慢，我来了" --search -e 5
 python scripts/download_drama.py -n "剧名" --search -b 10
 
 # 连续下载全集（不限数量）
-python scripts/download_drama.py -n "剧名" --search -b
+python scripts/download_drama.py -n "十八岁太奶奶驾到，重整家族荣耀" --search -b
 
 # 从第 3 集开始连续下载 5 集（手动模式也支持批量）
 python scripts/download_drama.py -e 3 -b 5
@@ -157,6 +157,10 @@ python scripts/download_drama.py -n "爹且慢，我来了" --search -e 3
 
 # 示例 3：搜索并批量下载全集
 python scripts/download_drama.py -n "爹且慢，我来了" --search -b
+
+# 
+# 示例 3：搜索并批量下载5集
+python scripts/download_drama.py -n "凡人仙葫第一季" --search -b 5
 
 # 示例 4：挂载到已运行的 App（不重启 App）
 python scripts/download_drama.py --attach-running -n "剧名"
@@ -201,6 +205,68 @@ videos/
 | `--attach-running` | | false | 挂载到已运行的 App，不重启 |
 | `--preprocess` | | false | 额外生成 LLM 素材包（关键帧 + ASR） |
 | `--whisper-model` | | large-v3 | Whisper 模型：tiny / base / small / medium / large-v3 |
+
+---
+
+### 断点续传与会话清单
+
+#### 自动断点续传
+
+下载器支持自动断点续传。如果批量下载中途中断（脚本崩溃、手动 Ctrl+C、网络断开等），重新运行相同命令即可从断点继续：
+
+```bash
+# 首次运行：下载到第 20 集时中断
+python scripts/download_drama.py -n "剧名" --search -b 80
+
+# 重新运行：自动跳过前 20 集，从第 21 集继续
+python scripts/download_drama.py -n "剧名" --search -b 80
+```
+
+断点续传基于 `session_manifest.jsonl` 文件，该文件记录每次下载的历史。
+
+#### 自动重试机制
+
+当单集下载失败时（网络超时、解密失败等），脚本自动重试最多 3 次：
+
+- 每次重试前清空 Hook 数据状态，确保数据刷新
+- 重试间隔 2 秒，避免触发 App 限流
+- 重试历史记录到 `session_manifest.jsonl`
+
+#### session_manifest.jsonl 格式
+
+每次下载会在输出目录生成 `session_manifest.jsonl` 文件（每行一个 JSON 对象）：
+
+```jsonl
+{"episode": 1, "status": "downloaded", "video_id": "abc12345", "resolution": "720p", "video_path": "episode_001_abc12345.mp4", "retry_count": 0, "timestamp": 1713196800.0}
+{"episode": 2, "status": "retry_attempt", "attempt": 1, "reason": "download_failed", "timestamp": 1713196850.0}
+{"episode": 2, "status": "retry_success", "video_id": "def67890", "resolution": "720p", "video_path": "episode_002_def67890.mp4", "retry_count": 0, "timestamp": 1713196860.0}
+{"episode": 3, "status": "skipped_resume", "reason": "already_completed", "timestamp": 1713196900.0}
+```
+
+**字段说明**：
+
+- `episode`: 集数
+- `status`: 状态（downloaded | skipped_existing | skipped_resume | retry_attempt | retry_success | failed_after_retries）
+- `video_id`: 视频 ID（8 位后缀）
+- `resolution`: 分辨率
+- `video_path`: 解密后视频路径（相对路径）
+- `retry_count`: 重试次数（0 表示首次成功）
+- `timestamp`: Unix 时间戳
+
+#### 离线审计
+
+使用 `audit_drama_downloads.py` 审计下载质量：
+
+```bash
+python scripts/audit_drama_downloads.py videos/剧名 --expected-total 80
+```
+
+审计工具会：
+
+- 识别缺失的集数
+- 检测重复文件
+- 分析 `session_manifest.jsonl` 中的重试模式
+- 生成重命名建议
 
 ---
 
