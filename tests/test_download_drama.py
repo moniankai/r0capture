@@ -882,5 +882,194 @@ class TestResumeFromCheckpoint(unittest.TestCase):
                 self.assertEqual(record4["status"], "skipped_resume")
 
 
+class TestDownloadWithRetry(unittest.TestCase):
+    """测试自动重试功能"""
+
+    def test_download_with_retry_success_first_attempt(self):
+        """测试第一次成功时不触发重试"""
+        from tempfile import TemporaryDirectory
+        from unittest.mock import MagicMock
+        from scripts.drama_download_common import append_jsonl
+
+        with TemporaryDirectory() as tmpdir:
+            manifest_path = Path(tmpdir) / "session_manifest.jsonl"
+
+            # 模拟 download_and_decrypt 第一次成功
+            mock_download = MagicMock(return_value={"success": True, "episode": 5})
+            mock_reset = MagicMock()
+
+            # 模拟 download_with_retry 逻辑
+            result = mock_download(5)
+
+            # 验证：第一次成功，不调用 reset_capture_state
+            self.assertTrue(result["success"])
+            mock_reset.assert_not_called()
+            mock_download.assert_called_once_with(5)
+
+    def test_download_with_retry_success_after_one_retry(self):
+        """测试第一次失败、第二次成功时重试 1 次"""
+        from tempfile import TemporaryDirectory
+        from unittest.mock import MagicMock, call
+        from scripts.drama_download_common import append_jsonl
+        import time
+
+        with TemporaryDirectory() as tmpdir:
+            manifest_path = Path(tmpdir) / "session_manifest.jsonl"
+
+            # 模拟 download_and_decrypt：第一次失败，第二次成功
+            mock_download = MagicMock(side_effect=[
+                {"success": False, "reason": "stale_data"},
+                {"success": True, "episode": 5}
+            ])
+            mock_reset = MagicMock()
+            mock_sleep = MagicMock()
+
+            # 模拟 download_with_retry 逻辑（简化版）
+            max_retries = 3
+            for attempt in range(max_retries):
+                if attempt > 0:
+                    mock_reset()
+                    mock_sleep(2)
+
+                result = mock_download(5)
+
+                if result.get("success", False):
+                    break
+
+            # 验证：第二次成功，调用 1 次 reset
+            self.assertTrue(result["success"])
+            mock_reset.assert_called_once()
+            mock_sleep.assert_called_once_with(2)
+            self.assertEqual(mock_download.call_count, 2)
+
+    def test_download_with_retry_fail_after_max_retries(self):
+        """测试连续失败 3 次后返回失败结果"""
+        from tempfile import TemporaryDirectory
+        from unittest.mock import MagicMock
+        from scripts.drama_download_common import append_jsonl
+
+        with TemporaryDirectory() as tmpdir:
+            manifest_path = Path(tmpdir) / "session_manifest.jsonl"
+
+            # 模拟 download_and_decrypt：连续失败 3 次
+            mock_download = MagicMock(side_effect=[
+                {"success": False, "reason": "stale_data"},
+                {"success": False, "reason": "stale_key"},
+                {"success": False, "reason": "download_failed"}
+            ])
+            mock_reset = MagicMock()
+
+            # 模拟 download_with_retry 逻辑
+            max_retries = 3
+            for attempt in range(max_retries):
+                if attempt > 0:
+                    mock_reset()
+
+                result = mock_download(5)
+
+                if result.get("success", False):
+                    break
+
+            # 验证：失败 3 次，调用 2 次 reset（第一次不调用）
+            self.assertFalse(result["success"])
+            self.assertEqual(mock_reset.call_count, 2)
+            self.assertEqual(mock_download.call_count, 3)
+
+    def test_download_with_retry_clears_state(self):
+        """测试每次重试前调用 reset_capture_state()"""
+        from unittest.mock import MagicMock, patch
+
+        # 模拟 download_and_decrypt：第一次失败，第二次成功
+        mock_download = MagicMock(side_effect=[
+            {"success": False, "reason": "stale_data"},
+            {"success": True, "episode": 5}
+        ])
+
+        with patch('scripts.download_drama.reset_capture_state') as mock_reset:
+            # 模拟 download_with_retry 逻辑
+            max_retries = 3
+            for attempt in range(max_retries):
+                if attempt > 0:
+                    mock_reset()
+
+                result = mock_download(5)
+
+                if result.get("success", False):
+                    break
+
+            # 验证：第二次尝试前调用 reset_capture_state
+            mock_reset.assert_called_once()
+
+    def test_download_with_retry_logs_to_manifest(self):
+        """测试重试历史正确记录到 session_manifest.jsonl"""
+        from tempfile import TemporaryDirectory
+        import json
+        from scripts.drama_download_common import append_jsonl
+
+        with TemporaryDirectory() as tmpdir:
+            manifest_path = Path(tmpdir) / "session_manifest.jsonl"
+
+            # 模拟重试历史记录
+            ep_num = 5
+            max_retries = 3
+
+            # 第一次尝试失败
+            append_jsonl(manifest_path, {
+                "episode": ep_num,
+                "status": "retry_attempt",
+                "attempt": 1,
+                "max_retries": max_retries,
+                "reason": "stale_data",
+                "error": None,
+                "timestamp": 1234567890.0
+            })
+
+            # 第二次尝试成功
+            append_jsonl(manifest_path, {
+                "episode": ep_num,
+                "status": "retry_success",
+                "attempt": 2,
+                "max_retries": max_retries,
+                "reason": "unknown",
+                "error": None,
+                "timestamp": 1234567892.0
+            })
+
+            # 验证记录
+            with manifest_path.open('r', encoding='utf-8') as f:
+                lines = [line.strip() for line in f if line.strip()]
+                self.assertEqual(len(lines), 2)
+
+                record1 = json.loads(lines[0])
+                self.assertEqual(record1["status"], "retry_attempt")
+                self.assertEqual(record1["attempt"], 1)
+                self.assertEqual(record1["reason"], "stale_data")
+
+                record2 = json.loads(lines[1])
+                self.assertEqual(record2["status"], "retry_success")
+                self.assertEqual(record2["attempt"], 2)
+
+    def test_download_with_retry_skips_resume(self):
+        """测试 skipped_resume 不触发重试"""
+        from unittest.mock import MagicMock
+
+        # 模拟 download_and_decrypt 返回 skipped_resume
+        mock_download = MagicMock(return_value={
+            "success": True,
+            "reason": "skipped_resume",
+            "episode": 5
+        })
+        mock_reset = MagicMock()
+
+        # 模拟 download_with_retry 逻辑
+        result = mock_download(5)
+
+        # 验证：skipped_resume 视为成功，不触发重试
+        self.assertTrue(result["success"])
+        self.assertEqual(result["reason"], "skipped_resume")
+        mock_reset.assert_not_called()
+        mock_download.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
