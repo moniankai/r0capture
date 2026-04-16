@@ -194,3 +194,76 @@ def list_available_adapters() -> List[str]:
         ['douyin', 'honguo', 'kuaishou']
     """
     return sorted(_ADAPTER_REGISTRY.keys())
+
+
+# ============================================================================
+# HongGuoAdapter 实现
+# ============================================================================
+
+@register_adapter('honguo')
+class HongGuoAdapter(AppAdapter):
+    """红果短剧 App 适配器
+
+    封装红果 App (com.phoenix.read) 特定的逻辑，包括：
+    - 包名和 Hook 脚本路径
+    - UI XML 解析（剧名、集数、总集数）
+    - 选集操作（通过 ADB UI 自动化）
+
+    所有实现委托给 drama_download_common 中的现有函数，保持向后兼容。
+    """
+
+    app_name = 'honguo'
+
+    def get_package_name(self, **kwargs) -> str:
+        """返回红果 App 的 Android 包名
+
+        Returns:
+            'com.phoenix.read'
+        """
+        return 'com.phoenix.read'
+
+    def get_hook_script(self, **kwargs) -> str:
+        """返回红果 App 的 Frida Hook 脚本路径
+
+        注意：返回的是文件路径，不是脚本内容。调用方需要读取文件内容，
+        或使用 download_drama.py 中的内联 COMBINED_HOOK 脚本。
+
+        Returns:
+            'frida_hooks/ttengine_all.js'
+        """
+        return 'frida_hooks/ttengine_all.js'
+
+    def parse_ui_context(self, xml: str, **kwargs) -> UIContext:
+        """解析红果 App 的 UI XML
+
+        委托给 drama_download_common.parse_ui_context() 实现。
+
+        Args:
+            xml: uiautomator dump 输出的 XML 字符串
+            **kwargs: 预留参数（当前未使用）
+
+        Returns:
+            UIContext 实例，包含剧名、集数、总集数等信息
+
+        Raises:
+            ValueError: 如果 XML 格式无效
+        """
+        from scripts.drama_download_common import parse_ui_context
+        return parse_ui_context(xml)
+
+    def select_episode(self, ep_num: int, **kwargs) -> bool:
+        """在红果 App 内选择指定集数
+
+        委托给 drama_download_common.select_episode_from_ui() 实现。
+
+        Args:
+            ep_num: 目标集数（从 1 开始）
+            **kwargs: 可选参数
+                - max_attempts: 最大重试次数（默认 8）
+
+        Returns:
+            True 表示选集成功，False 表示失败
+        """
+        from scripts.drama_download_common import select_episode_from_ui
+        max_attempts = kwargs.get('max_attempts', 8)
+        return select_episode_from_ui(ep_num, max_attempts=max_attempts)

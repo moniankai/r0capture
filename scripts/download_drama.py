@@ -63,6 +63,13 @@ from scripts.drama_download_common import (
     parse_ui_context,
     sanitize_drama_name,
     validate_round,
+    run_adb,
+    tap_bounds,
+    read_ui_xml_from_device,
+    select_episode_from_ui,
+    should_enter_player_from_detail,
+    is_target_episode_selected_in_detail,
+    tap_detail_cover_to_enter_player,
 )
 
 APP_PACKAGE = "com.phoenix.read"
@@ -453,9 +460,6 @@ class DownloadTaskState:
     first_missing_episode: int | None = None
 
 
-def run_adb(args: list[str]) -> None:
-    env = {**os.environ, "MSYS_NO_PATHCONV": "1"}
-    subprocess.run(["adb"] + args, capture_output=True, check=False, env=env)
 
 
 def get_frida_usb_device():
@@ -550,12 +554,7 @@ def click_next_episode_button() -> bool:
     return True
 
 
-def tap_bounds(bounds: tuple[int, int, int, int]) -> None:
-    x, y = bounds_center(bounds)
-    run_adb(["shell", "input", "tap", str(x), str(y)])
-
-
-def _find_episode_button(xml_text: str, ep_num: int) -> tuple | None:
+def detect_ui_context_from_device() -> UIContext:
     """在选集网格中查找指定集数按钮的 bounds。
 
     只匹配 resource-id 为 ``ivi`` 的选集按钮，避免误命中
@@ -790,35 +789,6 @@ def select_episode_from_ui(ep_num: int, max_attempts: int = 8) -> bool:
     return False
 
 
-def read_ui_xml_from_device() -> str:
-    """dump 并返回手机当前 UI XML。
-
-    两步命令均加了 timeout，避免设备渲染视频时 uiautomator dump 无限挂起。
-    dump 失败（非零退出码）时先删除旧文件再返回空串，防止 cat 读到陈旧数据。
-    """
-    env = {**os.environ, "MSYS_NO_PATHCONV": "1"}
-    try:
-        dump_result = subprocess.run(
-            ["adb", "shell", "uiautomator", "dump", "/sdcard/_ui.xml"],
-            capture_output=True, check=False, env=env, timeout=12,
-        )
-    except subprocess.TimeoutExpired:
-        logger.debug("[ADB] uiautomator dump 超时 (12s)")
-        return ""
-    if dump_result.returncode != 0:
-        logger.debug(f"[ADB] uiautomator dump 失败 (rc={dump_result.returncode})")
-        return ""
-    try:
-        result = subprocess.run(
-            ["adb", "shell", "cat", "/sdcard/_ui.xml"],
-            capture_output=True, check=False, env=env, timeout=8,
-        )
-    except subprocess.TimeoutExpired:
-        logger.debug("[ADB] cat _ui.xml 超时 (8s)")
-        return ""
-    if result.returncode != 0 or not result.stdout:
-        return ""
-    return result.stdout.decode("utf-8", errors="replace")
 
 
 def get_current_activity() -> str:
@@ -873,15 +843,6 @@ def choose_batch_navigation_mode(xml_text: str, activity: str = "") -> str:
     return "search"
 
 
-def should_enter_player_from_detail(xml_text: str) -> bool:
-    """选集后如果仍停在详情页，则需要补一次进入播放器动作。"""
-    if not xml_text:
-        return False
-    return (
-        'com.phoenix.read:id/ivi' in xml_text
-        and 'com.phoenix.read:id/jjj' not in xml_text
-    )
-
 
 def titles_match_loose(expected: str, actual: str) -> bool:
     """处理阿拉伯数字到中文数字转换的宽松标题匹配。"""
@@ -891,16 +852,6 @@ def titles_match_loose(expected: str, actual: str) -> bool:
     if stripped and stripped != expected and stripped in actual:
         return True
     return False
-
-
-def is_target_episode_selected_in_detail(xml_text: str, target_episode: int) -> bool:
-    """确认详情页当前高亮选中的确实是目标集。"""
-    if not xml_text:
-        return False
-    if not should_enter_player_from_detail(xml_text):
-        return False
-    context = parse_ui_context(xml_text)
-    return context.episode == target_episode
 
 
 def wait_for_target_episode_on_device(
@@ -921,11 +872,6 @@ def wait_for_target_episode_on_device(
             return True
         time.sleep(poll_seconds)
     return False
-
-
-def tap_detail_cover_to_enter_player() -> None:
-    """点击详情页封面区，触发当前已选剧集真正进入播放器。"""
-    run_adb(["shell", "input", "tap", "195", "474"])
 
 
 def resolve_actual_episode(
