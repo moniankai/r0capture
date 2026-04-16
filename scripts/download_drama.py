@@ -37,6 +37,7 @@ import subprocess
 import sys
 import threading
 import time
+import yaml
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -49,6 +50,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from scripts.decrypt_video import decrypt_mp4, fix_metadata
 from scripts.preprocess_video import process_episode
+from scripts.app_adapter import create_adapter, AppAdapter
 from scripts.drama_download_common import (
     UIContext,
     SessionValidationState,
@@ -73,6 +75,52 @@ from scripts.drama_download_common import (
 )
 
 APP_PACKAGE = "com.phoenix.read"
+
+# ============================================================================
+# 配置加载和 Adapter 管理
+# ============================================================================
+
+def load_config(config_path: str = "config.yaml") -> dict:
+    """加载配置文件
+
+    Args:
+        config_path: 配置文件路径
+
+    Returns:
+        配置字典
+
+    Raises:
+        FileNotFoundError: 配置文件不存在（返回默认配置）
+        yaml.YAMLError: 配置文件格式错误
+    """
+    path = Path(config_path)
+    if not path.exists():
+        logger.warning(f"配置文件 {config_path} 不存在，使用默认配置")
+        return {"app": "honguo"}  # 默认配置（向后兼容）
+
+    with open(path, 'r', encoding='utf-8') as f:
+        return yaml.safe_load(f)
+
+
+_adapter_instance: Optional[AppAdapter] = None
+
+
+def get_adapter() -> AppAdapter:
+    """获取全局 adapter 实例"""
+    if _adapter_instance is None:
+        raise RuntimeError("Adapter not initialized. Call set_adapter() first.")
+    return _adapter_instance
+
+
+def set_adapter(adapter: AppAdapter):
+    """设置全局 adapter 实例"""
+    global _adapter_instance
+    _adapter_instance = adapter
+
+
+# ============================================================================
+# Frida Hook 脚本
+# ============================================================================
 
 # 组合 Frida Hook：Java 层 TTVideoEngine URL + Native 层 av_aes_init key
 @dataclass
@@ -1026,9 +1074,10 @@ def open_search_via_deeplink() -> bool:
     跳转后如果检测到搜索 EditText，则返回 True。
     """
     env = {**os.environ, "MSYS_NO_PATHCONV": "1"}
+    app_pkg = get_adapter().get_package_name()
     subprocess.run(
         ["adb", "shell", "am", "start", "-a", "android.intent.action.VIEW",
-         "-d", "dragon8662://search", APP_PACKAGE],
+         "-d", "dragon8662://search", app_pkg],
         capture_output=True, check=False, env=env,
     )
     # 从视频播放器切换到搜索页面需要 3-4 秒；视频渲染期间 uiautomator 可能返回 rc=137
@@ -1059,7 +1108,7 @@ def detect_ui_context_from_device() -> UIContext:
     if not xml_text:
         return UIContext()
 
-    context = parse_ui_context(xml_text)
+    context = get_adapter().parse_ui_context(xml_text)
     if context.title:
         logger.info(f"[UI] Title: {context.title}")
     if context.episode is not None:
@@ -1136,11 +1185,12 @@ def _exit_to_home_screen(max_attempts: int = 4) -> bool:
 
         xml_text = read_ui_xml_from_device()
         if xml_text:
+            app_pkg = get_adapter().get_package_name()
             # 已经在 Android 桌面，不在 App 内；这对后续 deeplink 是可接受状态
-            if APP_PACKAGE not in xml_text:
+            if app_pkg not in xml_text:
                 logger.info("[搜索] 已确认在 Android 桌面")
                 return True
-            if APP_PACKAGE in xml_text:
+            if app_pkg in xml_text:
                 has_home_tabs = "首页" in xml_text or "剧场" in xml_text
                 in_player = "全屏观看" in xml_text or "倍速" in xml_text
                 if has_home_tabs and not in_player:
@@ -1384,7 +1434,7 @@ def _try_start_episode_on_drama_page(ep_num: int, state: Optional[CaptureState] 
         # 搜索后 App 会自动播放"续播"集（非目标集），Hook 已将其写入 state。
         # 点击 picker 前清空 state，确保 _snap_refs[0] 是目标集而非续播集。
         reset_capture_state()
-        if not select_episode_from_ui(ep_num):
+        if not get_adapter().select_episode(ep_num):
             logger.error(f"[搜索] 选集面板未能切换到第 {ep_num} 集")
             return False
         return True
@@ -1488,9 +1538,10 @@ def search_drama_in_app(name: str, start_episode: int = 1, state: Optional[Captu
     if not search_page_ready:
         logger.info("[搜索] 深度链接均失败，尝试直接启动App后点击搜索图标...")
         env = {**os.environ, "MSYS_NO_PATHCONV": "1"}
+        app_pkg = get_adapter().get_package_name()
         subprocess.run(
             ["adb", "shell", "am", "start", "-n",
-             f"{APP_PACKAGE}/{APP_PACKAGE}.activity.MainFragmentActivity"],
+             f"{app_pkg}/{app_pkg}.activity.MainFragmentActivity"],
             capture_output=True, check=False, env=env,
         )
         time.sleep(3.0)  # 等待 App 主界面加载
@@ -1601,7 +1652,7 @@ def search_drama_in_app(name: str, start_episode: int = 1, state: Optional[Captu
         # 注意：之前此处有 `if start_episode > 1` 守卫，导致第1集时跳过了导航，
         # App 续播直接进入播放器后控制层隐藏，脚本无法确认集号，捕获超时。
         reset_capture_state()  # 回退路径：picker 直接选集前也要清空 state
-        if not select_episode_from_ui(start_episode):
+        if not get_adapter().select_episode(start_episode):
             logger.warning(f"[搜索] 无法自动选集，请手动选择第 {start_episode} 集")
 
     if not wait_for_target_episode_on_device(name, start_episode, timeout_seconds=40, poll_seconds=1):
@@ -1631,6 +1682,13 @@ def download_file(url: str, path: str) -> bool:
 
 
 def main() -> None:
+    # 加载配置并创建 adapter
+    config = load_config()
+    app_name = config.get('app', 'honguo')
+    adapter = create_adapter(app_name)
+    set_adapter(adapter)
+    logger.info(f"使用 {app_name} adapter (包名: {adapter.get_package_name()})")
+
     parser = argparse.ArgumentParser(description="红果短剧一键下载（URL + Key + 解密）")
     parser.add_argument("--name", "-n", default="", help="剧名（留空则自动识别）")
     parser.add_argument("--name-file", default="", help="从 UTF-8 文本文件读取目标剧名，避免命令行编码问题")
@@ -1860,18 +1918,18 @@ def main() -> None:
         return
     if args.attach_running:
         logger.info("\n[1/5] Attach to running App...")
-        pid = select_running_app_pid(device.enumerate_processes(), APP_PACKAGE)
+        pid = select_running_app_pid(device.enumerate_processes(), adapter.get_package_name())
         if pid is None:
-            logger.error(f"{APP_PACKAGE} is not running; cannot attach")
+            logger.error(f"{adapter.get_package_name()} is not running; cannot attach")
             return
         logger.info("[2/5] Attach App + 安装 Frida 双 Hook...")
     else:
         logger.info("\n[1/5] 停止现有 App...")
-        run_adb(["shell", "su", "-c", f"am force-stop {APP_PACKAGE}"])
+        run_adb(["shell", "su", "-c", f"am force-stop {adapter.get_package_name()}"])
         time.sleep(1)
 
         logger.info("[2/5] 启动 App + 安装 Frida 双 Hook...")
-        pid = device.spawn([APP_PACKAGE])
+        pid = device.spawn([adapter.get_package_name()])
     session = device.attach(pid)
     script = session.create_script(COMBINED_HOOK)
     script.on("message", on_message)
@@ -2477,7 +2535,7 @@ def main() -> None:
         def try_player_panel_recovery(expected_ep: int) -> tuple[bool, bool, str | None]:
             # state 已在批量循环开头清空，此处直接打开选集面板切换目标集
             logger.info(f"[恢复] 打开选集面板并跳转到第{expected_ep}集")
-            if not select_episode_from_ui(expected_ep):
+            if not get_adapter().select_episode(expected_ep):
                 logger.warning(f"[恢复] 选集面板无法跳到第{expected_ep}集")
                 return False, False, "panel_navigation_failed"
 
