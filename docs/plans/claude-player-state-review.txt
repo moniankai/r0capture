@@ -1,0 +1,143 @@
+---
+
+## 1. Critical Issues
+
+**C1 — Task 4 depends on stop semantics not yet locked in Task 5, forcing a double-rewrite**
+
+The plan orders Task 4 ("Player-First Batch Loop") before Task 5 ("Total Episode Priority And Stop Logic"). But the main loop must emit the stop decision — `break` vs. `continue` vs. `recover` — on every round. Writing the loop in Task 4 without the stop contract finalized means every stop-related branch must be written twice. The current batch loop (lines 1626–1752 of `download_drama.py`) already has at least six distinct break/continue exit points, and adding the "two consecutive rounds" fallback from the stop spec will require restructuring those exits. Tasks 4 and 5 must be merged or reversed.
+
+**C2 — Plan's File Semantics rule 1 turns instant skips into full captures**
+
+The plan states (File Semantics §1): "Existing local files can be skipped only after the runtime has positively confirmed the current round is truly episode N."
+
+The current code skips *before* any navigation or capture:
+
+```python
+# download_drama.py:1638–1642
+if os.path.exists(ep_path) and os.path.getsize(ep_path) > 0:
+    logger.info(f"\n  第{expected_ep}集已存在，跳过: {os.path.basename(ep_path)}")
+    downloaded += 1
+    current_ep = expected_ep
+    continue
+```
+
+Under the plan, resuming a 60-episode drama where 50 episodes already exist would require swiping to each episode, waiting for Frida capture (12s timeout per swipe path, 30s for the search fallback path), reading UI XML, and only *then* deciding to skip. This turns a sub-second resume check into a 10-minute device operation. The plan does not acknowledge this regression anywhere.
+
+**C3 — `DownloadTaskState` vs. `SessionValidationState` reconciliation is unspecified**
+
+`SessionValidationState` (drama_download_common.py:54–58) already tracks `locked_title`, `seen_video_ids`, and `last_episode`. The plan's `DownloadTaskState` adds `last_confirmed_episode`, `target_title`, `locked_total_episodes`, `consecutive_end_signals`, and `consecutive_recovery_failures`.
+
+Both structures track "title lock" and "last episode seen." The plan never says whether `DownloadTaskState` replaces, wraps, or runs alongside `SessionValidationState`. The `validate_round()` and `apply_valid_round()` functions (drama_download_common.py:318–371) take `SessionValidationState` directly — if that type is changed or abandoned, every call site in `download_and_decrypt()` (line 1454, line 1498) must also change. Task 1 cannot be implemented safely without this decision documented first.
+
+**C4 — The `duplicate_video_id` bypass is silently deleted by Task 3's uniform reject rule**
+
+The plan (Main Loop §Reject rules, item 4): "duplicate `video_id` → Reject and do not write files."
+
+But the current loop has a special handler:
+
+```python
+# download_drama.py:1677–1681
+if reason == 'duplicate_video_id':
+    logger.warning(f"  第{expected_ep}集视频重复（可能预加载缓存），跳过继续")
+    current_ep = expected_ep
+    downloaded += 1
+    continue
+```
+
+The same pattern repeats at lines 1742–1746. This is not a bug — it handles the app's pre-cache behavior where the same video_id is returned for a legitimately different episode slot. Applying the plan's uniform reject rule breaks the loop on cached episodes and causes it to stall on the same episode indefinitely. The plan never mentions this pattern.
+
+---
+
+## 2. Medium Issues
+
+**M1 — Recovery step 3 ("player episode panel jump") is new UI automation, not refactoring**
+
+The plan's Recovery Order §3: "Open player episode panel and explicitly jump to N+1."
+
+There is no function in the codebase that opens the player's `选集` overlay (resource-id `com.phoenix.read:id/joj`, visible in `PLAYER_OVERLAY_XML` in tests) and then selects a specific episode from within it. The existing `select_episode_from_ui()` operates on the detail page episode grid, not the player overlay. This step requires new tap-and-select automation estimated nowhere in the plan. It is silently bundled inside "Recovery Order" as if it already exists.
+
+**M2 — `total_eps` update pipeline conflicts with `locked_total_episodes` immutability**
+
+The plan (Runtime Model §4): "If user input exists and UI later reports a different total, log a consistency warning but do not overwrite the user value."
+
+The current code unconditionally overwrites `total_eps` from each successful download result:
+
+```python
+# download_drama.py:1669–1671
+new_total = result.get("total_episodes")
+if new_total:
+    total_eps = new_total
+```
+
+This pattern runs inside the swipe path (line 1669) and the search path (line 1735). The `total_episodes` value is fed from `ui_context.total_episodes` inside `download_and_decrypt()` (line 1479). Unless `download_and_decrypt()` is also patched to suppress the total-episode field when a user-supplied value is active, the locking semantics from Task 5 will be silently overridden on every round after the first.
+
+**M3 — `--episode` default change silently breaks existing scripted workflows**
+
+Currently `--episode` defaults to `1` (line 1157). The plan (Start Episode §2): "If the user does not pass `--episode`, scan the output directory for existing `episode_XXX` files and choose the first missing episode."
+
+This changes `--episode`'s role from "explicit start override" to "cap on the auto-scan result." Any automation script invoking the downloader without `--episode` and expecting it to start from episode 1 will silently start from wherever the gap is. The plan should introduce a separate `--resume` flag rather than hijacking the `--episode` default, but no migration guidance is given.
+
+**M4 — `consecutive_end_signals` stop rule requires restructuring all break points in the loop**
+
+The plan (Stop Conditions §3): stop only after "this failure pattern happens in two consecutive rounds." The current loop exits on the first unrecoverable failure at lines 1697, 1722–1723, and 1751–1752. Implementing the two-round gate means converting three `break` statements into counter increments and a deferred break. The plan does not acknowledge the refactoring scope — it lists this as a single bullet in Task 5.
+
+---
+
+## 3. Do Not Adopt
+
+**D1 — Demote full drama search to "final recovery path only"**
+
+The inline comment at lines 1646–1651 documents exactly why search cannot be demoted further:
+
+```python
+# 在这个 App 中，从播放器按 BACK 不会返回详情页。
+# _try_start_episode_on_drama_page 在播放器页也可能返回 True，回退逻辑不可靠。
+# 只有 search_drama_in_app 能稳定到达详情页；在详情页点击集数按钮会触发
+# setVideoModel 和完整 URL 解析，随后 video_info 触发、video_urls 填充，捕获成功。
+```
+
+The plan treats this hard-won operational knowledge as a design smell to be eliminated. But the reason search is used as the current fallback is that swipe and back-navigation are unreliable in this app. Adding an additional "player episode panel" recovery layer between swipe and search adds complexity without removing the need for search when the player state becomes inconsistent.
+
+**D2 — `DownloadTaskState` as a top-level class before validating the interaction model**
+
+Task 1 creates a new state class with 9 fields before any of the behavioral changes that use those fields are designed. The existing `SessionValidationState` is a 3-field dataclass that is *already* insufficient (no persistence across restarts, no consecutive-failure counter). Adding a second state class that partially overlaps it creates two sources of truth for "last confirmed episode" and "title lock." The class should emerge after the interaction model for Tasks 2–5 is stabilized, not be written first.
+
+---
+
+## 4. Smaller Safer Alternative
+
+Three independent, low-risk changes that deliver most of the plan's value without the state-class coupling problem:
+
+**Alt-1 — Standalone `find_first_missing_episode(output_dir, start=1)` function (Task 2 in isolation)**
+
+Add a pure function that globs `episode_*.mp4` files, extracts episode numbers, and returns the first gap. Wire it to a new `--resume` flag (not to `--episode` default). This is ~20 lines and has no coupling to the batch loop.
+
+**Alt-2 — `--total-episodes` CLI arg updating a `user_total_eps` variable**
+
+Add one argument, one variable, and one priority check before the existing `total_eps` stop condition at line 1630. No new class, no new state, no change to `download_and_decrypt()`. The consistency warning can be a log line when `new_total != user_total_eps`.
+
+**Alt-3 — Change the single-failure break to a consecutive-failure counter**
+
+Replace the `break` at line 1751 with:
+
+```python
+consecutive_failures += 1
+if consecutive_failures >= 2:
+    break
+```
+
+This is the exact behavior described in Stop Conditions §3 and requires touching one variable and one line in the loop.
+
+These three changes can be tested independently with the existing test infrastructure (`tests/test_download_drama.py`) without touching `validate_round()`, `apply_valid_round()`, `SessionValidationState`, or `download_and_decrypt()`.
+
+---
+
+## 5. Still Valid
+
+- **Round confirmation contract (Task 3 core intent)**: The five-condition gate (title, episode, new video_id, URL, key) is already partially enforced in `validate_round()` (drama_download_common.py:318–343) and `download_and_decrypt()` (lines 1431–1444). Centralizing this into a single function that all write/skip paths call is correct. The risk is only in how it interacts with the `duplicate_video_id` bypass (C4 above); that carve-out must be preserved explicitly.
+
+- **Swipe-first navigation mode (already implemented)**: The priority of swipe over search is already in the codebase at lines 1658–1684. The plan correctly identifies this as the preferred architecture. No implementation work is needed here — only documentation of the existing intent.
+
+- **UI total as fallback, not primary (Task 5 intent)**: The principle that user-supplied totals should override UI-parsed totals is sound. The existing code always takes UI totals, which fails when the app returns wrong counts for ongoing series. This is a real bug worth fixing.
+
+- **Regression test cases (Task 6 list)**: All six scenarios listed are testable with mocked `DownloadTaskState` or the existing `SessionValidationState`. Even if the class design changes, the test cases themselves are correct and cover real failure modes observed in the current loop.

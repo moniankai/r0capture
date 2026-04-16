@@ -1,0 +1,181 @@
+---
+
+## 1. Critical Issues
+
+### 1.1 `output_dir` does not exist at task-start — the first-missing-episode scan is blocked in manual and unnamed flows
+
+The plan (Start Episode, rule 2–5) requires scanning the output directory for existing `episode_XXX` files **before the runtime starts**. The codebase contradicts this directly.
+
+`output_dir` is initialized as an empty string:
+```python
+# download_drama.py:1281-1282
+output_dir = ""
+session_manifest_path = ""
+```
+
+It is populated only inside `resolve_output_dir()`, which is called on line 1423 inside `download_and_decrypt`, which is itself called only after `wait_for_capture()` returns. When the user does not supply `--name`, `drama_name` is `""` at startup (line 1181), so `resolve_output_dir` cannot produce a valid path until the first Frida message arrives.
+
+The plan's compatibility note says "This decision must be made before implementation starts" but does not resolve it — it defers to an optional `--resume` flag that is never designed. Task 1 cannot be implemented as written without first deciding how `output_dir` is obtained before capture begins. This voids the pre-scan premise for any non-`--name` invocation.
+
+---
+
+### 1.2 `user_total_episodes` and `--batch` are semantically different things; the plan conflates them
+
+The plan treats `user_total_episodes` as an absolute series length ("the drama has 80 episodes in total"). The only existing user-supplied count is `--batch N` (line 1166–1168), which means "download N more episodes from the current start." These are not the same:
+
+- `--batch 75` starting from episode 5 downloads through episode 79.
+- `user_total_episodes=80` would stop when confirmed episode reaches 80, regardless of start.
+
+The plan says `user_total_episodes` comes from "user input" but no `--total` (or similar) argument exists or is defined. Implementing the plan as written requires adding new CLI surface. That new flag is never described, its interaction with `--batch` is undefined, and neither the argument parser block (lines 1153–1175) nor the test suite covers it.
+
+---
+
+### 1.3 Task 4's pre-scan is a prerequisite for Task 3, but the plan orders them in reverse
+
+Task 3 is "Implement the main loop and stop semantics." Task 4 is "Implement the hybrid skip strategy," including the "fast local pre-scan determines the first missing episode before runtime starts."
+
+The pre-scan's output — the start episode — is needed by the main loop (Task 3, step "Confirm we are currently on episode N"). Without knowing N, the swipe-first loop cannot determine what "N+1" is. Task 4 must deliver the pre-scan result before Task 3 is written. The task order is wrong.
+
+---
+
+### 1.4 No rollback strategy for a 1769-line monolithic `main()` function
+
+`main()` spans lines 1153–1765 with deeply nested closures (`on_message`, `resolve_output_dir`, `download_and_decrypt`) sharing state through `nonlocal` bindings. Tasks 2, 3, and 4 all modify this function concurrently. The plan provides no feature flag, no parallel code path, and no described rollback procedure. A half-complete Task 3 that breaks the existing swipe path leaves the entire downloader non-functional with no safe intermediate state to fall back to.
+
+---
+
+## 2. Medium Issues
+
+### 2.1 Recovery step 3 is not "new UI automation work" — it already exists
+
+The plan states under Recovery Order, implementation note 1:
+
+> "Recovery step 3 is new UI automation work, not a refactor of existing detail-page selection code."
+
+`select_episode_from_ui(ep_num)` is 115 lines of mature code at lines 432–546, handling episode grid opening, 30+ episode pagination, range tab switching, and retry logic. The N-1→N recovery already calls it (lines 1711–1716). This is **not** new work. Marking it as new risks duplicating this logic or writing a conflicting implementation in Task 3.
+
+---
+
+### 2.2 The plan's `duplicate_video_id` "bounded tolerance" changes existing unconditional behavior
+
+The current batch loop unconditionally advances on duplicate:
+```python
+# download_drama.py:1677-1681
+if reason == 'duplicate_video_id':
+    logger.warning(f"  第{expected_ep}集视频重复（可能预加载缓存），跳过继续")
+    current_ep = expected_ep
+    downloaded += 1
+    continue
+```
+
+The plan adds: "if the duplicate appears without supporting UI/episode confirmation, reject the round." This is a behavioral change. It requires reading `ui_context` at the point where the current code only has `reason == 'duplicate_video_id'`. The current code has already cleared `state` (line 1644) before the swipe. There is no `ui_context` available at the `reason` check point. Implementing bounded tolerance requires restructuring the decision flow, not just adding a condition.
+
+---
+
+### 2.3 `consecutive_end_signals` replaces current one-shot title_mismatch recovery without addressing the existing path
+
+The batch loop currently handles `title_mismatch` with one-shot tolerance at lines 1747–1750:
+```python
+if reason == 'title_mismatch':
+    logger.warning(f"  第{expected_ep}集抓到了错误剧目，清状态后重试目标剧")
+    state.clear()
+    continue
+```
+
+This retries immediately on the next iteration. The plan replaces this with "two consecutive strong end signals." But the plan does not say what happens to the existing `continue` on `title_mismatch`. If the plan's counter is overlaid without removing this `continue`, the counter will never reach 2 (the loop retries indefinitely). If the `continue` is removed, the current automation that tolerates transient title drift between episodes breaks.
+
+---
+
+### 2.4 Dual state for confirmed episode number (`last_episode` vs. `last_confirmed_episode`)
+
+`SessionValidationState.last_episode` (line 58) is the existing source of truth for monotonic episode confirmation, updated by `apply_valid_round` (line 369). The plan adds `last_confirmed_episode` to the task-level wrapper. The plan's "Ownership rules" say `validation_state.last_episode` remains the source of truth — but then introduces `last_confirmed_episode` at the task layer for stop logic. The stop condition (plan rule 1) reads "current confirmed episode >= user_total_episodes." Which field is "current confirmed episode"? If it's `last_confirmed_episode`, it must be kept in sync with `state.last_episode`. The plan does not specify the sync contract, and a desync between them would cause premature or missed stops.
+
+---
+
+### 2.5 "First episode already exists" skip at line 1578 is a third skip path not covered by the hybrid strategy
+
+The plan describes a two-path hybrid (pre-scan + round-confirmed skip). The codebase has a third skip path: the first-episode existence check at lines 1574–1580, before `wait_for_capture` is even called:
+```python
+first_ep_path, _ = build_episode_paths(output_dir, current_ep, '', drama_name=drama_name)
+if os.path.exists(first_ep_path) and os.path.getsize(first_ep_path) > 0:
+    first_result = {"success": True, "episode": current_ep}
+```
+This skip happens without a round confirmation and without updating `session_state`. The plan's Task 4 rule — "Unknown-episode rounds must never create or rename episode_XXX files" — does not apply to skips, but neither does "Already-downloaded files may be skipped only when the current round is confirmed to be episode N." This path skips without any confirmed round, which is inconsistent with the plan's contract. The plan is silent on this.
+
+---
+
+### 2.6 Test coverage for Task 5's new stop conditions is missing key cases
+
+Task 5 lists 7 regression tests. Missing from the list:
+
+- Recovery escalation: swipe fails → panel recovery fails → search is triggered (the full 3-step cascade).
+- `consecutive_recovery_failures` counter resets after a successful round.
+- Pre-scan correctly handles an output directory that does not yet exist.
+- `user_total_episodes` provided + drama is at episode 50 out of user's stated 60: stop does not fire early.
+
+---
+
+## 3. Do Not Adopt
+
+### "Two consecutive strong end signals required when no total is available" as the only stop guard
+
+The plan's stop condition 3 requires that two consecutive rounds each show a foreign title or non-continuous episode before stopping. The existing code breaks on the first non-duplicate failure (lines 1751–1752):
+```python
+logger.error(f"Episode {expected_ep} failed: {reason}")
+break
+```
+
+The proposed change means that on a real series end — where the swipe lands on a different title — the downloader will:
+1. Detect foreign title on round 1, record `consecutive_end_signals = 1`, and attempt recovery.
+2. Recovery (step 3: `select_episode_from_ui(N+1)`) will fail because episode N+1 does not exist.
+3. Recovery (step 5: search) will fail for the same reason.
+4. Only after round 2 failure does it stop.
+
+This adds one full recovery cycle (including a search round-trip, which takes 15–30 seconds of ADB navigation) to every legitimate series end. More importantly, the "search relocation" recovery on a completed drama will land on episode 1, not N+1, potentially triggering a false positive that resets the counter. The two-signal requirement is not safe without first verifying that `select_episode_from_ui(N+1)` actively failed due to episode absence, not due to a UI timing issue.
+
+---
+
+## 4. Smaller Safer Alternative
+
+Instead of rewriting the main loop and state from scratch across 4 interdependent tasks:
+
+**Step A: Fix `--episode` default resolution separately (Task 1 subset)**
+Add a `_find_first_missing_episode(output_dir, drama_name)` helper in `drama_download_common.py` that globs `<drama_name>_episode_*.mp4` and returns the first gap. Call it only when `drama_name` is known at startup (i.e., `--name` was provided). Leave the lazy `output_dir` resolution intact for manual flows. Gate with an explicit `--resume` flag per the plan's own compatibility note, resolving the deferred decision before writing any loop code.
+
+**Step B: Add `--total N` as a new optional CLI argument (new surface)**
+Wire it to `user_total_episodes` immutably after parse. Use it only as a stop override on top of the existing `total_eps` (UI-derived). Do not rename or replace `total_eps`. This keeps the existing stop logic intact while adding the override layer.
+
+**Step C: Centralize round confirmation into a named function `_confirm_round()` without restructuring the loop**
+Pull the existing `validate_round` call, `_titles_match`, and key/URL checks from `download_and_decrypt` into a `_confirm_round(state, ui_context, vid, key, url, expected_ep)` function. The loop body calls this function. This is a pure refactor with no behavior change and directly enables Task 2 without touching Task 3.
+
+**Step D: Defer the consecutive-end-signals counter change** until the plain stop logic (using `--total`) proves stable in production.
+
+---
+
+## 5. Still Valid
+
+### 5.1 "Do not create an independent top-level state object that overlaps with `SessionValidationState`"
+
+Correct. `SessionValidationState` (lines 54–58) and `CaptureState` (lines 200–271) already split validation state from capture state cleanly. A third top-level state object would create a third ownership claim on `last_episode`. The plan's guidance to either extend or wrap is sound.
+
+### 5.2 Ownership rules for `locked_title` and `last_episode`
+
+The plan correctly preserves `validation_state.locked_title` and `validation_state.last_episode` as sources of truth. These are already enforced in `validate_round` (lines 337–342) and `apply_valid_round` (lines 365–370). No conflict with the existing validation contract.
+
+### 5.3 "Search is the final fallback, not the default route"
+
+The current batch loop already implements this pattern (lines 1658–1699): swipe first, then search as fallback. The plan correctly identifies it and proposes inserting the episode-panel recovery step between them. The pattern itself is correct.
+
+### 5.4 "Reject and do not write files when episode number is not confirmed"
+
+Already enforced at line 1442–1444:
+```python
+if actual_episode is None:
+    logger.error(f"[集号] UI 和 Hook 均未检测到真实集号，拒绝落盘 (vid={vid})")
+    return {"success": False, "reason": "missing_episode"}
+```
+The plan's rule is already satisfied. Task 2 formalizing it is safe and non-breaking.
+
+### 5.5 Round Confirmation tests (Task 5 items 1, 2, 4, 5, 7)
+
+The test structure and fixtures in `test_download_drama.py` (lines 1–293) are well-established. The proposed tests reuse existing patterns (`SessionValidationState`, `validate_round`, `build_episode_paths`). Items 1, 2, 4, 5, and 7 of Task 5 are directly testable without device access and fit the existing `unittest` framework.
