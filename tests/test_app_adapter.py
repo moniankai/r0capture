@@ -242,5 +242,112 @@ class TestAdapterInterface(unittest.TestCase):
         self.assertTrue(result)
 
 
+class TestHongGuoAdapter(unittest.TestCase):
+    """测试 HongGuoAdapter 实现"""
+
+    def setUp(self):
+        """每个测试前确保 HongGuoAdapter 已注册"""
+        # 导入 HongGuoAdapter 以触发 @register_adapter 装饰器
+        from scripts.app_adapter import HongGuoAdapter
+        # 如果未注册，手动注册
+        if 'honguo' not in _ADAPTER_REGISTRY:
+            _ADAPTER_REGISTRY['honguo'] = HongGuoAdapter
+
+    def test_honguo_adapter_creation(self):
+        """验证可以通过工厂函数创建 HongGuoAdapter"""
+        adapter = create_adapter('honguo')
+
+        # 验证 app_name 属性
+        self.assertEqual(adapter.app_name, 'honguo')
+        # 验证是 AppAdapter 的实例（通过检查方法存在性）
+        self.assertTrue(hasattr(adapter, 'get_package_name'))
+        self.assertTrue(hasattr(adapter, 'get_hook_script'))
+        self.assertTrue(hasattr(adapter, 'parse_ui_context'))
+        self.assertTrue(hasattr(adapter, 'select_episode'))
+
+    def test_honguo_adapter_get_package_name(self):
+        """验证返回正确的包名"""
+        adapter = create_adapter('honguo')
+        package = adapter.get_package_name()
+
+        self.assertEqual(package, 'com.phoenix.read')
+
+    def test_honguo_adapter_get_hook_script(self):
+        """验证返回正确的 Hook 脚本路径"""
+        from pathlib import Path
+
+        adapter = create_adapter('honguo')
+        hook_script = adapter.get_hook_script()
+
+        self.assertEqual(hook_script, 'frida_hooks/ttengine_all.js')
+
+        # 验证文件存在
+        script_path = Path(hook_script)
+        self.assertTrue(script_path.exists(), f"Hook script not found: {hook_script}")
+
+    def test_honguo_adapter_parse_ui_context(self):
+        """验证 UI 解析委托给 drama_download_common.parse_ui_context"""
+        adapter = create_adapter('honguo')
+
+        # 创建一个简单的 mock XML（包含红果 App 的 resource-id）
+        # 使用实际的 UI 结构：剧名在 d4，当前集在 jjj，总集数在 jr1
+        mock_xml = '''<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy rotation="0">
+  <node text="测试剧名" resource-id="com.phoenix.read:id/d4" bounds="[0,100][1080,200]" />
+  <node text="第5集" resource-id="com.phoenix.read:id/jjj" bounds="[0,200][100,300]" />
+  <node text="共80集" resource-id="com.phoenix.read:id/jr1" bounds="[100,200][200,300]" />
+</hierarchy>'''
+
+        # 调用 parse_ui_context
+        context = adapter.parse_ui_context(mock_xml)
+
+        # 验证解析结果
+        self.assertIsInstance(context, UIContext)
+        self.assertEqual(context.title, '测试剧名')
+        # 注意：parse_ui_context 从 "第5集" 和 "共80集" 中提取数字
+        self.assertEqual(context.episode, 5)
+        self.assertEqual(context.total_episodes, 80)
+
+    def test_honguo_adapter_select_episode_mock(self):
+        """验证 select_episode 委托给 drama_download_common.select_episode_from_ui"""
+        from unittest.mock import patch
+
+        adapter = create_adapter('honguo')
+
+        # Mock select_episode_from_ui 函数
+        with patch('scripts.drama_download_common.select_episode_from_ui') as mock_select:
+            mock_select.return_value = True
+
+            # 调用 adapter 的 select_episode
+            result = adapter.select_episode(5)
+
+            # 验证底层函数被调用
+            mock_select.assert_called_once_with(5, max_attempts=8)
+            self.assertTrue(result)
+
+    def test_honguo_adapter_select_episode_with_max_attempts(self):
+        """验证 select_episode 支持 max_attempts 参数"""
+        from unittest.mock import patch
+
+        adapter = create_adapter('honguo')
+
+        # Mock select_episode_from_ui 函数
+        with patch('scripts.drama_download_common.select_episode_from_ui') as mock_select:
+            mock_select.return_value = False
+
+            # 调用 adapter 的 select_episode，传递自定义 max_attempts
+            result = adapter.select_episode(10, max_attempts=15)
+
+            # 验证底层函数被调用，且 max_attempts 参数正确传递
+            mock_select.assert_called_once_with(10, max_attempts=15)
+            self.assertFalse(result)
+
+    def test_honguo_adapter_registered(self):
+        """验证 HongGuoAdapter 已注册到工厂"""
+        available = list_available_adapters()
+
+        self.assertIn('honguo', available)
+
+
 if __name__ == '__main__':
     unittest.main()
