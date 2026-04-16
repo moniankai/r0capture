@@ -420,6 +420,97 @@ def parse_session_manifest(manifest_path: str | Path) -> set[int]:
     return completed
 
 
+def append_debug_log(log_path: str | Path, message: str, level: str = 'INFO') -> None:
+    """追加调试日志到指定文件。
+
+    Args:
+        log_path: 日志文件路径（通常为 output_dir/download_debug.log）
+        message: 日志消息
+        level: 日志级别（INFO, WARNING, ERROR, DEBUG）
+    """
+    import datetime
+
+    target = Path(log_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+    log_line = f"[{timestamp}] [{level:7s}] {message}\n"
+
+    with target.open('a', encoding='utf-8', newline='\n') as fh:
+        fh.write(log_line)
+
+
+def log_episode_details(
+    log_path: str | Path,
+    episode: int,
+    video_id: str = '',
+    cdn_url: str = '',
+    aes_key_hex: str = '',
+    resolution: str = '',
+    file_size: int = 0,
+    status: str = '',
+    error: str = '',
+    ui_context: Optional[UIContext] = None,
+    extra_info: dict = None,
+) -> None:
+    """记录单集下载的详细信息到调试日志。
+
+    Args:
+        log_path: 日志文件路径
+        episode: 集数
+        video_id: 完整的 video_id
+        cdn_url: CDN 下载 URL
+        aes_key_hex: AES 密钥（32 位 hex 字符串）
+        resolution: 分辨率（如 720p, 1080p）
+        file_size: 文件大小（字节）
+        status: 状态（downloading, success, failed, skipped）
+        error: 错误信息（如果有）
+        ui_context: UI 上下文信息
+        extra_info: 其他额外信息
+    """
+    lines = []
+    lines.append("=" * 80)
+    lines.append(f"第 {episode} 集下载详情")
+    lines.append("=" * 80)
+
+    if ui_context:
+        lines.append(f"剧名: {ui_context.title}")
+        lines.append(f"当前集数: {ui_context.episode}")
+        lines.append(f"总集数: {ui_context.total_episodes}")
+
+    lines.append(f"状态: {status}")
+
+    if video_id:
+        lines.append(f"Video ID: {video_id}")
+        lines.append(f"Video ID (后8位): {video_id_suffix(video_id, 8)}")
+
+    if cdn_url:
+        lines.append(f"CDN URL: {cdn_url}")
+
+    if aes_key_hex:
+        lines.append(f"AES 密钥 (hex): {aes_key_hex}")
+
+    if resolution:
+        lines.append(f"分辨率: {resolution}")
+
+    if file_size > 0:
+        size_mb = file_size / (1024 * 1024)
+        lines.append(f"文件大小: {size_mb:.2f} MB ({file_size} 字节)")
+
+    if error:
+        lines.append(f"错误信息: {error}")
+
+    if extra_info:
+        lines.append("额外信息:")
+        for key, value in extra_info.items():
+            lines.append(f"  {key}: {value}")
+
+    lines.append("")  # 空行分隔
+
+    message = "\n".join(lines)
+    append_debug_log(log_path, message, level='INFO' if status == 'success' else 'ERROR' if error else 'INFO')
+
+
 # ============================================================================
 # ADB UI 自动化函数（从 download_drama.py 迁移）
 # ============================================================================

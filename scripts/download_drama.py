@@ -2089,6 +2089,10 @@ def main() -> None:
         # 断点续传：检查集数是否已完成
         if ep_num in completed_episodes:
             logger.info(f"[断点续传] 第 {ep_num} 集已完成，跳过")
+            # 记录跳过到调试日志
+            debug_log_path = os.path.join(output_dir, "download_debug.log")
+            from scripts.drama_download_common import append_debug_log
+            append_debug_log(debug_log_path, f"第 {ep_num} 集已完成（断点续传），跳过", level='INFO')
             _log_to_manifest("skipped_resume", reason="already_completed")
             return {"success": True, "reason": "skipped_resume", "episode": ep_num}
 
@@ -2314,6 +2318,10 @@ def main() -> None:
                 video_path=dec_path,
                 meta_path=meta_path
             )
+            # 记录跳过到调试日志
+            debug_log_path = os.path.join(output_dir, "download_debug.log")
+            from scripts.drama_download_common import append_debug_log
+            append_debug_log(debug_log_path, f"第 {actual_episode} 集已存在，跳过下载", level='INFO')
             # 传入空 video_id，避免把当前捕获 ID 加入 seen_video_ids；
             # 当前捕获的视频可能不同于已存文件。
             apply_valid_round(
@@ -2331,6 +2339,31 @@ def main() -> None:
         logger.info(f"  Size: {int(best.get('size', 0)) / 1024 / 1024:.1f} MB")
         logger.info(f"  Key: {key_hex}")
 
+        # 记录下载开始到调试日志
+        debug_log_path = os.path.join(output_dir, "download_debug.log")
+        from scripts.drama_download_common import log_episode_details, append_debug_log
+
+        append_debug_log(debug_log_path, f"开始下载第 {actual_episode} 集", level='INFO')
+        log_episode_details(
+            debug_log_path,
+            episode=actual_episode,
+            video_id=vid,
+            cdn_url=best["main_url"],
+            aes_key_hex=key_hex,
+            resolution=best["resolution"],
+            file_size=int(best.get('size', 0)),
+            status='downloading',
+            ui_context=ui_context,
+            extra_info={
+                'codec': best.get('codec', ''),
+                'kid': best.get('kid', ''),
+                'backup_url': best.get('backup_url', ''),
+                'captured_video_url_count': len(state.video_urls),
+                'captured_key_count': len(state.aes_keys),
+                'match_strategy': match_stats.get('strategy', 'unknown'),
+            }
+        )
+
         enc_path = os.path.join(output_dir, f"_ep{actual_episode:03d}_{vid[:8]}_enc.mp4")
 
         url = best["main_url"]
@@ -2338,6 +2371,14 @@ def main() -> None:
             backup = best.get("backup_url", "")
             if not backup or not download_file(backup, enc_path):
                 logger.error("CDN download failed")
+                append_debug_log(debug_log_path, f"第 {actual_episode} 集下载失败: CDN 下载失败", level='ERROR')
+                log_episode_details(
+                    debug_log_path,
+                    episode=actual_episode,
+                    video_id=vid,
+                    status='failed',
+                    error='CDN download failed (main and backup URLs)',
+                )
                 return {"success": False, "reason": "download_failed", "episode": actual_episode}
 
         logger.info("Decrypting...")
@@ -2345,8 +2386,20 @@ def main() -> None:
             raw = bytearray(f.read())
 
         key_bytes = bytes.fromhex(key_hex)
-        total = decrypt_mp4(raw, key_bytes)
-        fix_metadata(raw)
+        try:
+            total = decrypt_mp4(raw, key_bytes)
+            fix_metadata(raw)
+        except Exception as e:
+            logger.error(f"解密失败: {e}")
+            append_debug_log(debug_log_path, f"第 {actual_episode} 集解密失败: {e}", level='ERROR')
+            log_episode_details(
+                debug_log_path,
+                episode=actual_episode,
+                video_id=vid,
+                status='failed',
+                error=f'Decryption failed: {e}',
+            )
+            return {"success": False, "reason": "decrypt_failed", "episode": actual_episode, "error": str(e)}
 
         with open(dec_path, "wb") as f:
             f.write(raw)
@@ -2377,6 +2430,25 @@ def main() -> None:
         )
 
         logger.info(f"  --> {dec_path} ({len(raw) / 1024 / 1024:.1f}MB, {total} samples)")
+
+        # 记录下载成功到调试日志
+        append_debug_log(debug_log_path, f"第 {actual_episode} 集下载成功", level='INFO')
+        log_episode_details(
+            debug_log_path,
+            episode=actual_episode,
+            video_id=vid,
+            cdn_url=best["main_url"],
+            aes_key_hex=key_hex,
+            resolution=best["resolution"],
+            file_size=len(raw),
+            status='success',
+            ui_context=ui_context,
+            extra_info={
+                'decrypted_samples': total,
+                'output_path': dec_path,
+                'meta_path': meta_path,
+            }
+        )
 
         if args.preprocess:
             logger.info("  Preparing LLM assets...")
@@ -2413,10 +2485,15 @@ def main() -> None:
             }
             append_jsonl(session_manifest_path, record)
 
+        # 调试日志路径
+        debug_log_path = os.path.join(output_dir, "download_debug.log")
+        from scripts.drama_download_common import append_debug_log
+
         result = {}
         for attempt in range(max_retries):
             if attempt > 0:
                 logger.warning(f"[重试] 第 {ep_num} 集下载失败，开始第 {attempt + 1}/{max_retries} 次重试")
+                append_debug_log(debug_log_path, f"第 {ep_num} 集开始第 {attempt + 1}/{max_retries} 次重试", level='WARNING')
                 # 重试前清空 Hook 数据状态
                 reset_capture_state()
                 logger.debug(f"[重试] 已清空 CaptureState，等待 2 秒后重试")
@@ -2441,6 +2518,11 @@ def main() -> None:
             # 最后一次尝试失败，记录最终失败状态
             if attempt == max_retries - 1:
                 logger.error(f"[重试] 第 {ep_num} 集重试 {max_retries} 次后仍失败: {result.get('reason', 'unknown')}")
+                append_debug_log(
+                    debug_log_path,
+                    f"第 {ep_num} 集重试 {max_retries} 次后仍失败: {result.get('reason', 'unknown')}",
+                    level='ERROR'
+                )
                 _log_retry_to_manifest(
                     "failed_after_retries",
                     max_retries=max_retries,
