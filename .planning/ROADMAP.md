@@ -59,12 +59,12 @@ Plans:
   1. 用户下载 80 集短剧时，如果中途脚本崩溃或手动中断，重新运行后能从断点继续（无需重新下载已完成的集数）
   2. 当单集下载失败时（网络超时、解密失败等），脚本自动重试最多 3 次，每次重试前清空 state
   3. session_manifest.jsonl 中记录每次重试的历史（包括失败原因和重试次数），便于离线审计
-**Plans**: TBD
+**Plans**: 3 plans in 3 waves
 
 Plans:
-- [ ] 03-01: TBD
-- [ ] 03-02: TBD
-
+- [ ] 03-01-PLAN.md — 断点续传机制（读取 session_manifest.jsonl 识别已下载集数）
+- [ ] 03-02-PLAN.md — 自动重试机制（max_retries=3，每次重试前清空状态）
+- [ ] 03-03-PLAN.md — 会话持久化增强（标准化记录格式，更新 README）
 ### Phase 4: AppAdapter 抽象
 **Goal**: 建立多 App 支持的架构基础，为扩展到快手、抖音等平台做准备
 **Depends on**: Phase 3
@@ -88,5 +88,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 |-------|----------------|--------|-----------|
 | 1. 核心稳定性修复 | 4/4 | Complete | 2026-04-15 |
 | 2. Hook 数据校验增强 | 0/3 | Ready to execute | - |
-| 3. 错误恢复机制改进 | 0/2 | Not started | - |
+| 3. 错误恢复机制改进 | 0/3 | Not started | - |
 | 4. AppAdapter 抽象 | 0/2 | Not started | - |
