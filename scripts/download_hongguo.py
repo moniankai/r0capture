@@ -445,16 +445,30 @@ def build_plan(output_dir: str, total_eps: int, start_ep: int = 1) -> list[dict]
     return plan
 
 
-def advance_to_next_episode(state: HookState, timeout: float = 8.0) -> bool:
-    """切换到下一集：tap 唤醒控制层 → tap 下一集按钮
+def advance_to_next_episode(state: HookState, prev_video_id: str = "",
+                            timeout: float = 8.0) -> bool:
+    """切换到下一集，等待出现不同 video_id 的 Hook 数据
 
-    实测确认红果播放器的有效切集方式是 tap(540,960) 唤醒控制层后
-    tap(960,960) 点击右侧"下一集"按钮。唤醒控制层后上滑也会生效，
-    作为 fallback 保留。
+    通过比对 video_id 而非简单计数来判断是否真正换集，
+    避免同一集多画质触发多次 setVideoModel 导致误判。
 
-    Returns: True 表示检测到新 Hook 数据（说明换集成功）
+    Args:
+        prev_video_id: 上一集的 video_id，用于去重。为空则退化为计数检测。
+
+    Returns: True 表示检测到不同 video_id 的新 Hook 数据
     """
     old_ref_count = len(state.refs)
+
+    def _has_new_episode() -> bool:
+        if len(state.refs) <= old_ref_count:
+            return False
+        if not prev_video_id:
+            return True
+        # 检查是否有不同于上一集的 video_id
+        for ref in state.refs[old_ref_count:]:
+            if ref.video_id != prev_video_id:
+                return True
+        return False
 
     # 主策略：tap 控制层 + tap 下一集
     run_adb(["shell", "input", "tap", "540", "960"])
@@ -463,7 +477,7 @@ def advance_to_next_episode(state: HookState, timeout: float = 8.0) -> bool:
 
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if len(state.refs) > old_ref_count:
+        if _has_new_episode():
             new_ref = state.refs[-1]
             logger.info(f"[切集] 成功 (vid={new_ref.video_id[:16]}...)")
             return True
@@ -474,7 +488,7 @@ def advance_to_next_episode(state: HookState, timeout: float = 8.0) -> bool:
     run_adb(["shell", "input", "swipe", "540", "1600", "540", "300", "250"])
     deadline = time.time() + 5
     while time.time() < deadline:
-        if len(state.refs) > old_ref_count:
+        if _has_new_episode():
             new_ref = state.refs[-1]
             logger.info(f"[切集] 成功-上滑 (vid={new_ref.video_id[:16]}...)")
             return True
@@ -683,6 +697,7 @@ def main():
     success_count = 0
     failed_eps = []
     need_advance = False  # 首集无需切集，后续每集都需要
+    last_video_id = ""     # 上一集的 video_id，用于去重
 
     for task in tqdm(plan, desc="下载进度"):
         ep_num = task["ep"]
@@ -690,7 +705,7 @@ def main():
         # 切集（跳过首集）
         if need_advance:
             try:
-                if not advance_to_next_episode(state):
+                if not advance_to_next_episode(state, prev_video_id=last_video_id):
                     logger.warning(f"[第{ep_num}集] 切集失败")
                     if task["status"] != "done":
                         failed_eps.append(ep_num)
@@ -703,8 +718,11 @@ def main():
                 continue
         need_advance = True
 
-        # 已完成的集只需切集跳过
+        # 已完成的集只需切集跳过，更新 last_video_id
         if task["status"] == "done":
+            ref, _, _ = state.get_latest()
+            if ref:
+                last_video_id = ref.video_id
             logger.debug(f"[第{ep_num}集] 已完成，跳过")
             continue
 
@@ -713,12 +731,19 @@ def main():
         result = None
 
         if ref and url and key:
+            # 去重检查：如果 get_latest 返回的 video_id 和上一集相同，说明是多画质重复
+            if ref.video_id == last_video_id and last_video_id:
+                logger.warning(f"[第{ep_num}集] video_id 与上一集重复 ({ref.video_id[:16]}...)，跳过")
+                failed_eps.append(ep_num)
+                continue
+
             vid8 = ref.video_id[-8:] if len(ref.video_id) >= 8 else ref.video_id
             output_path = os.path.join(output_dir, f"episode_{ep_num:03d}_{vid8}.mp4")
             expected_dur = ref.duration if ref.duration > 0 else 0
             if download_and_decrypt(url, key.key_hex, output_path) \
                     and verify_playable(output_path, expected_duration=expected_dur):
                 result = {"success": True, "ep": ep_num, "video_id": ref.video_id, "path": output_path}
+                last_video_id = ref.video_id
             else:
                 if os.path.exists(output_path):
                     os.remove(output_path)
@@ -727,9 +752,13 @@ def main():
             # get_latest 失败，fallback 到围栏捕获
             try:
                 result = download_current_episode(ep_num, state, output_dir, time.time() - 30)
+                if result and result.get("success"):
+                    last_video_id = result.get("video_id", "")
             except frida.InvalidOperationError:
                 session, script, pid = recover_frida(state, drama_name)
                 result = download_current_episode(ep_num, state, output_dir, time.time())
+                if result and result.get("success"):
+                    last_video_id = result.get("video_id", "")
 
         if result is None:
             result = {"success": False, "ep": ep_num, "video_id": "", "path": ""}
