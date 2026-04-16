@@ -62,8 +62,8 @@ Plans:
 **Plans**: 3 plans in 3 waves
 
 Plans:
-- [ ] 03-01-PLAN.md — 断点续传机制（读取 session_manifest.jsonl 识别已下载集数）
-- [ ] 03-02-PLAN.md — 自动重试机制（max_retries=3，每次重试前清空状态）
+- [x] 03-01-PLAN.md — 断点续传机制（读取 session_manifest.jsonl 识别已下载集数）
+- [x] 03-02-PLAN.md — 自动重试机制（max_retries=3，每次重试前清空状态）
 - [ ] 03-03-PLAN.md — 会话持久化增强（标准化记录格式，更新 README）
 
 ### Phase 4: AppAdapter 抽象
