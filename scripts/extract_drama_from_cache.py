@@ -29,6 +29,8 @@ def main():
 
     # 设置输出目录
     base_dir = Path(args.output) / args.drama_name
+    base_dir.mkdir(parents=True, exist_ok=True)
+
     cache_dir = base_dir / "cache"
     full_dir = base_dir / "全集"
     episodes_dir = base_dir / "独立集数"
@@ -36,6 +38,20 @@ def main():
     full_video_path = full_dir / f"{args.drama_name}_全集.mp4"
     boundaries_file = base_dir / "ocr_boundaries.json"
     plan_file = base_dir / "split_plan.json"
+
+    # 配置日志落盘
+    log_file = base_dir / "extraction.log"
+    logger.add(
+        log_file,
+        rotation="10 MB",
+        retention="7 days",
+        encoding="utf-8",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}",
+        level="INFO"
+    )
+    logger.info(f"开始处理短剧: {args.drama_name}")
+    logger.info(f"输出目录: {base_dir}")
+    logger.info(f"日志文件: {log_file}")
 
     # 步骤 1: 拉取缓存
     if not args.step or args.step == "pull":
