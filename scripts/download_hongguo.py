@@ -310,3 +310,105 @@ def read_ui_total_episodes() -> int | None:
         run_adb(["shell", "input", "tap", "540", "960"])
         time.sleep(1.5)
     return None
+
+
+def wait_capture(state: HookState, fence_ts: float, timeout: float = 30.0):
+    """轮询 HookState，等待围栏后 ref+url+key 三者到齐
+
+    Returns: (ref, url, key) 或 None（超时）
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        ref, url, key = state.get_after_fence(fence_ts)
+        if ref and url and key:
+            return ref, url, key
+        time.sleep(0.5)
+    ref, url, key = state.get_after_fence(fence_ts)
+    logger.warning(f"[捕获] 超时: ref={'有' if ref else '无'} url={'有' if url else '无'} key={'有' if key else '无'}")
+    return None
+
+
+def download_and_decrypt(url: str, key_hex: str, output_path: str) -> bool:
+    """下载加密视频 + CENC 就地解密 + 写文件
+
+    使用临时文件写入，成功后再 rename，避免中断留下损坏文件。
+    """
+    tmp_path = output_path + ".tmp"
+    try:
+        logger.info(f"[下载] {url[:80]}...")
+        resp = requests.get(
+            url,
+            headers={"User-Agent": "AVDML_2.1.230.181-novel_ANDROID"},
+            timeout=120,
+        )
+        resp.raise_for_status()
+
+        data = bytearray(resp.content)
+        size_mb = len(data) / 1024 / 1024
+        logger.info(f"[下载] 完成: {size_mb:.1f}MB")
+
+        key_bytes = bytes.fromhex(key_hex)
+        sample_count = decrypt_mp4(data, key_bytes)
+        fix_metadata(data)
+        logger.info(f"[解密] {sample_count} samples 解密完成")
+
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        with open(tmp_path, "wb") as f:
+            f.write(data)
+        os.replace(tmp_path, output_path)
+        return True
+
+    except Exception as e:
+        logger.error(f"[下载] 失败: {e}")
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        return False
+
+
+def verify_playable(path: str) -> bool:
+    """用 ffprobe 验证文件可播放：有 video+audio stream，duration > 0，文件 > 100KB"""
+    if not os.path.exists(path):
+        return False
+    if os.path.getsize(path) < 100 * 1024:
+        logger.warning(f"[验证] 文件太小: {os.path.getsize(path)} bytes")
+        return False
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "stream=codec_type", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=15,
+        )
+        streams = result.stdout.strip().splitlines()
+        has_video = "video" in streams
+        has_audio = "audio" in streams
+        if not (has_video and has_audio):
+            logger.warning(f"[验证] 缺少轨道: video={has_video} audio={has_audio}")
+            return False
+
+        result2 = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "format=duration", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=15,
+        )
+        duration = float(result2.stdout.strip() or "0")
+        if duration <= 0:
+            logger.warning(f"[验证] duration={duration}")
+            return False
+
+        return True
+    except Exception as e:
+        logger.warning(f"[验证] ffprobe 失败: {e}")
+        return False
+
+
+def build_plan(output_dir: str, total_eps: int, start_ep: int = 1) -> list[dict]:
+    """生成下载计划，glob 已有文件跳过已完成的集数"""
+    plan = []
+    for ep in range(start_ep, total_eps + 1):
+        pattern = os.path.join(output_dir, f"episode_{ep:03d}_*.mp4")
+        existing = glob.glob(pattern)
+        if existing and os.path.getsize(existing[0]) > 100 * 1024:
+            plan.append({"ep": ep, "status": "done", "path": existing[0]})
+        else:
+            plan.append({"ep": ep, "status": "pending"})
+    return plan

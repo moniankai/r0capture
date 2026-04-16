@@ -140,3 +140,45 @@ def test_on_message_video_info_empty_url_ignored():
         "data": {"mMainUrl": "", "mResolution": "360p"},
     }}, None)
     assert len(state.urls) == 0
+
+
+def test_wait_capture_returns_none_on_empty_state():
+    from scripts.download_hongguo import HookState, wait_capture
+    state = HookState()
+    result = wait_capture(state, time.time(), timeout=1)
+    assert result is None
+
+
+def test_wait_capture_returns_data_when_available():
+    from scripts.download_hongguo import HookState, VideoRef, VideoURL, AESKey, wait_capture
+    state = HookState()
+    fence_ts = time.time()
+    def add_data():
+        time.sleep(0.3)
+        ts = time.time()
+        with state.lock:
+            state.refs.append(VideoRef(video_id="vid1", duration=60, timestamp=ts))
+            state.urls.append(VideoURL(video_id="vid1", url="http://test", quality="720p", kid="k1", timestamp=ts))
+            state.keys.append(AESKey(key_hex="a" * 32, bits=128, timestamp=ts))
+    t = threading.Thread(target=add_data)
+    t.start()
+    result = wait_capture(state, fence_ts, timeout=5)
+    t.join()
+    assert result is not None
+    ref, url, key = result
+    assert ref.video_id == "vid1"
+    assert url == "http://test"
+    assert key.key_hex == "a" * 32
+
+
+def test_build_plan_skips_existing():
+    from scripts.download_hongguo import build_plan
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ep_file = Path(tmpdir) / "episode_003_abcd1234.mp4"
+        ep_file.write_bytes(b"\x00" * 200_000)
+        plan = build_plan(tmpdir, total_eps=5, start_ep=1)
+        statuses = {p["ep"]: p["status"] for p in plan}
+        assert statuses[3] == "done"
+        assert statuses[1] == "pending"
+        assert statuses[5] == "pending"
