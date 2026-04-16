@@ -158,7 +158,7 @@ def create_on_message(state: HookState):
 
 def setup_frida(package: str, state: HookState) -> tuple:
     """Spawn App + 加载 COMBINED_HOOK，返回 (session, script, pid)"""
-    device = frida.get_usb_device()
+    device = frida.get_usb_device(timeout=10)
 
     # 先停止 App
     env = {**os.environ, "MSYS_NO_PATHCONV": "1"}
@@ -176,8 +176,19 @@ def setup_frida(package: str, state: HookState) -> tuple:
     device.resume(pid)
     logger.info(f"[Frida] App spawned, PID={pid}")
 
-    # 等待 Hook 就绪 + App 首页加载
-    time.sleep(15)
+    # 等待 Hook 就绪
+    time.sleep(5)
+
+    # 确保 App 在前台（spawn 后可能在后台）
+    subprocess.run(
+        ["adb", "shell", "monkey", "-p", package, "-c",
+         "android.intent.category.LAUNCHER", "1"],
+        capture_output=True, check=False, env=env,
+    )
+
+    # 等待 App 首页完全加载
+    logger.info("[Frida] 等待 App 首页加载...")
+    time.sleep(10)
 
     return session, script, pid
 
@@ -201,26 +212,28 @@ def navigate_to_offline_cache() -> bool:
     路径：首页 → 我的 → 设置 → 离线缓存
     返回 True 表示成功到达离线缓存页
     """
-    # 步骤 1：确认在首页
-    logger.info("[导航] 等待首页加载...")
-    xml = _wait_and_dump(delay=3.0)
-    if not xml:
-        logger.error("[导航] 无法获取首页 UI")
-        return False
+    # 步骤 1：暂停首页视频（首页有自动播放视频，会阻止 uiautomator dump）
+    logger.info("[导航] 暂停首页视频...")
+    run_adb(["shell", "input", "tap", "540", "400"])
+    time.sleep(1)
+    run_adb(["shell", "input", "tap", "540", "400"])
+    time.sleep(1)
 
-    # 步骤 2：点击"我的" Tab
+    xml = _wait_and_dump(delay=2.0)
+
+    # 步骤 2：点击"我的" Tab（右下角）
     logger.info("[导航] 点击「我的」...")
-    for attempt in range(3):
+    found_mine = False
+    if xml:
         bounds = find_text_bounds(xml, "我的")
         if bounds:
             tap_bounds(bounds)
-            xml = _wait_and_dump()
-            break
-        logger.warning(f"[导航] 未找到「我的」，重试 ({attempt + 1}/3)")
-        xml = _wait_and_dump()
-    else:
-        logger.error("[导航] 无法找到「我的」Tab")
-        return False
+            found_mine = True
+    if not found_mine:
+        # fallback：底部右下角 Tab 坐标（1080 宽屏幕，5 个 Tab，"我的"是最后一个）
+        logger.info("[导航] 用坐标 fallback 点击「我的」(972, 1890)")
+        run_adb(["shell", "input", "tap", "972", "1890"])
+    xml = _wait_and_dump(delay=2.0)
 
     # 步骤 3：点击设置图标
     logger.info("[导航] 点击「设置」...")
@@ -546,17 +559,53 @@ def main():
     if not player_ok:
         logger.warning("[2/4] 离线缓存入口失败，尝试搜索入口...")
         try:
-            from scripts.download_drama import search_drama_in_app
+            from scripts.download_drama import search_drama_in_app, set_adapter
+            from scripts.app_adapter import create_adapter
+            set_adapter(create_adapter("honguo"))
             player_ok = search_drama_in_app(drama_name, start_episode=start_ep)
         except Exception as e:
             logger.error(f"搜索入口也失败: {e}")
+
+    # 即使 search_drama_in_app 返回 False，通过多种方式确认播放器状态
+    if not player_ok:
+        logger.info("[2/4] 检查当前状态...")
+        # 方式 1：检查 Hook 是否已收到数据（说明播放器已在播放）
+        ref, url, key = state.get_after_fence(0)
+        if ref and url and key:
+            logger.info(f"[2/4] Hook 已捕获数据 (vid={ref.video_id[:16]}...)，确认播放器活跃")
+            player_ok = True
+        else:
+            # 方式 2：检查 UI
+            xml = _wait_and_dump(delay=2.0)
+            if xml:
+                ctx = parse_ui_context(xml)
+                if ctx.episode is not None:
+                    logger.info(f"[2/4] UI 确认在播放器中，当前第 {ctx.episode} 集")
+                    player_ok = True
+                elif find_text_contains_bounds(xml, drama_name):
+                    # 在详情页，点击封面进入播放器
+                    logger.info("[2/4] 在详情页，点击封面进入播放器...")
+                    run_adb(["shell", "input", "tap", "195", "400"])
+                    time.sleep(5)
+                    # 再检查 Hook
+                    ref2, url2, key2 = state.get_after_fence(0)
+                    if ref2 and key2:
+                        logger.info("[2/4] 点击封面后 Hook 收到数据，确认进入播放器")
+                        player_ok = True
 
     if not player_ok:
         logger.error("无法进入播放器，退出")
         return
 
-    # 4. 获取总集数
+    # 4. 获取总集数：先从详情页解析"全XX集"，再从播放器 UI 获取
     total_eps = read_ui_total_episodes()
+    if total_eps is None:
+        # 尝试从之前 dump 的 XML 解析"全XX集"
+        if xml:
+            import re as _re
+            m = _re.search(r'全(\d+)集', xml)
+            if m:
+                total_eps = int(m.group(1))
     if total_eps is None:
         logger.warning("无法从 UI 获取总集数，使用默认值 60")
         total_eps = 60
