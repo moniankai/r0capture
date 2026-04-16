@@ -65,6 +65,7 @@ Plans:
 - [ ] 03-01-PLAN.md — 断点续传机制（读取 session_manifest.jsonl 识别已下载集数）
 - [ ] 03-02-PLAN.md — 自动重试机制（max_retries=3，每次重试前清空状态）
 - [ ] 03-03-PLAN.md — 会话持久化增强（标准化记录格式，更新 README）
+
 ### Phase 4: AppAdapter 抽象
 **Goal**: 建立多 App 支持的架构基础，为扩展到快手、抖音等平台做准备
 **Depends on**: Phase 3
@@ -73,11 +74,12 @@ Plans:
   1. 开发者可以通过实现 AppAdapter 接口（定义 UI 元素定位、Hook 目标、文件名规则）来支持新的短剧 App
   2. 用户可以通过配置文件（如 `--app honguo` 或 `--app kuaishou`）选择目标 App，无需修改代码
   3. 红果 App 的所有现有功能（搜索、批量下载、解密）在新架构下仍正常工作（向后兼容）
-**Plans**: TBD
+**Plans**: 3 plans in 3 waves
 
 Plans:
-- [ ] 04-01: TBD
-- [ ] 04-02: TBD
+- [ ] 04-01-PLAN.md — AppAdapter 接口定义（抽象基类 + 工厂函数）
+- [ ] 04-02-PLAN.md — HongGuoAdapter 实现（迁移现有红果逻辑）
+- [ ] 04-03-PLAN.md — 配置文件加载和集成（config.yaml + 主流程集成）
 
 ## Progress
 
@@ -87,6 +89,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. 核心稳定性修复 | 4/4 | Complete | 2026-04-15 |
-| 2. Hook 数据校验增强 | 0/3 | Ready to execute | - |
+| 2. Hook 数据校验增强 | 2/3 | In progress | - |
 | 3. 错误恢复机制改进 | 0/3 | Not started | - |
-| 4. AppAdapter 抽象 | 0/2 | Not started | - |
+| 4. AppAdapter 抽象 | 0/3 | Not started | - |
