@@ -42,7 +42,7 @@ from scripts.drama_download_common import (
     append_jsonl,
 )
 from scripts.decrypt_video import decrypt_mp4, fix_metadata
-from scripts.download_drama import COMBINED_HOOK, select_episode_from_ui
+from scripts.download_drama import COMBINED_HOOK
 
 APP_PACKAGE = "com.phoenix.read"
 QUALITY_ORDER = {"1080p": 5, "720p": 4, "540p": 3, "480p": 2, "360p": 1}
@@ -90,6 +90,19 @@ class HookState:
             if ref:
                 matching = [u for u in self.urls
                             if u.video_id == ref.video_id and u.timestamp > fence_ts]
+                if matching:
+                    matching.sort(key=lambda u: QUALITY_ORDER.get(u.quality, 0), reverse=True)
+                    best_url = matching[0].url
+            return ref, best_url, key
+
+    def get_latest(self) -> tuple[VideoRef | None, str | None, AESKey | None]:
+        """返回最新的 ref、对应的最高画质 URL、最新的 key"""
+        with self.lock:
+            ref = self.refs[-1] if self.refs else None
+            key = self.keys[-1] if self.keys else None
+            best_url = None
+            if ref:
+                matching = [u for u in self.urls if u.video_id == ref.video_id]
                 if matching:
                     matching.sort(key=lambda u: QUALITY_ORDER.get(u.quality, 0), reverse=True)
                     best_url = matching[0].url
@@ -427,40 +440,76 @@ def build_plan(output_dir: str, total_eps: int, start_ep: int = 1) -> list[dict]
     return plan
 
 
-def download_episode(ep_num: int, state: HookState, output_dir: str, drama_name: str) -> dict:
-    """围栏式单集下载管线
+def advance_to_next_episode(state: HookState, timeout: float = 20.0) -> bool:
+    """尝试多种方式切换到下一集，等待 Hook 捕获新数据确认成功
 
-    Returns: {"success": bool, "ep": int, "video_id": str, "reason": str}
+    策略优先级：
+    1. 上滑手势（竖屏短剧标准操作）
+    2. 媒体键 NEXT
+    3. 点击播放器控制层的"下一集"区域
+
+    Returns: True 表示检测到新 Hook 数据（说明换集成功）
+    """
+    old_ref_count = len(state.refs)
+
+    methods = [
+        # (名称, 命令列表, 等待秒数)
+        ("上滑(快)", [["shell", "input", "swipe", "540", "1600", "540", "300", "250"]], 5),
+        ("上滑(慢)", [["shell", "input", "swipe", "540", "1700", "540", "200", "500"]], 5),
+        ("媒体键NEXT", [["shell", "input", "keyevent", "87"]], 5),
+        ("tap控制层+下一集", [
+            ["shell", "input", "tap", "540", "960"],  # 唤醒控制层
+        ], 1),
+        ("tap下一集按钮", [
+            ["shell", "input", "tap", "960", "960"],  # 右侧区域常见"下一集"位置
+        ], 5),
+    ]
+
+    for name, cmds, wait_sec in methods:
+        for cmd in cmds:
+            run_adb(cmd)
+            time.sleep(0.3)
+        logger.info(f"[切集] 尝试: {name}")
+
+        # 轮询等待新 Hook 数据
+        deadline = time.time() + wait_sec
+        while time.time() < deadline:
+            if len(state.refs) > old_ref_count:
+                new_ref = state.refs[-1]
+                logger.info(f"[切集] 成功! 新视频: {new_ref.video_id[:16]}... (方式: {name})")
+                return True
+            time.sleep(0.5)
+
+    logger.warning("[切集] 所有方式均未触发新 Hook 数据")
+    return False
+
+
+def download_current_episode(
+    ep_num: int, state: HookState, output_dir: str, fence_ts: float
+) -> dict:
+    """下载当前正在播放的集数（围栏式）
+
+    假设播放器已经在播放目标集，通过 Hook 围栏获取 URL/Key 后下载。
+
+    Returns: {"success": bool, "ep": int, "video_id": str, "reason": str, "path": str}
     """
     MAX_RETRIES = 3
 
     for attempt in range(MAX_RETRIES):
-        logger.info(f"[第{ep_num}集] 开始下载 (尝试 {attempt + 1}/{MAX_RETRIES})")
+        logger.info(f"[第{ep_num}集] 下载当前播放 (尝试 {attempt + 1}/{MAX_RETRIES})")
 
-        # 1. 设置围栏
-        fence_ts = time.time()
-
-        # 2. 选集
-        ok = select_episode_from_ui(ep_num)
-        if not ok:
-            logger.warning(f"[第{ep_num}集] 选集失败，重试")
-            time.sleep(2)
-            continue
-
-        # 3. 等待 Hook 数据
+        # 1. 等待 Hook 围栏后数据到齐
         result = wait_capture(state, fence_ts, timeout=30)
         if result is None:
-            logger.warning(f"[第{ep_num}集] 等待捕获超时，重试")
+            # 可能播放器卡住了，tap 一下触发
+            logger.warning(f"[第{ep_num}集] 等待捕获超时，tap 触发")
+            run_adb(["shell", "input", "tap", "540", "960"])
+            time.sleep(3)
+            fence_ts = time.time() - 5  # 回退 5 秒的围栏
             continue
         ref, url, key = result
 
-        # 4. UI 校验集数
-        ui_ep = read_ui_episode()
-        if ui_ep is not None and ui_ep != ep_num:
-            logger.warning(f"[第{ep_num}集] UI 显示第{ui_ep}集，不一致，重试")
-            continue
-
-        # 5. 下载 + 解密
+        # 2. 下载 + 解密
         vid8 = ref.video_id[-8:] if len(ref.video_id) >= 8 else ref.video_id
         output_path = os.path.join(output_dir, f"episode_{ep_num:03d}_{vid8}.mp4")
 
@@ -469,7 +518,7 @@ def download_episode(ep_num: int, state: HookState, output_dir: str, drama_name:
             logger.warning(f"[第{ep_num}集] 下载/解密失败，重试")
             continue
 
-        # 6. 验证
+        # 3. 验证
         if not verify_playable(output_path):
             logger.warning(f"[第{ep_num}集] 验证失败，删除文件并重试")
             if os.path.exists(output_path):
@@ -490,6 +539,7 @@ def download_episode(ep_num: int, state: HookState, output_dir: str, drama_name:
         "success": False,
         "ep": ep_num,
         "video_id": "",
+        "path": "",
         "reason": "max_retries_exceeded",
     }
 
@@ -617,22 +667,75 @@ def main():
     pending_count = sum(1 for p in plan if p["status"] == "pending")
     logger.info(f"[4/4] 下载计划: {pending_count} 集待下载, {done_count} 集已完成")
 
-    # 6. 逐集下载
+    # 6. 逐集下载（滑动前进策略）
+    #
+    # 策略：播放器已在目标剧中，搜索流程已导航到起始集附近。
+    # - 首个待下载集：直接下载当前播放的内容（不操作选集面板）
+    # - 后续集：上滑切换到下一集 → 等 Hook 捕获 → 下载
+    # - 跳过已完成的集时也需要滑动前进以保持同步
+    #
     manifest_path = os.path.join(output_dir, "session_manifest.jsonl")
     success_count = 0
     failed_eps = []
+    is_first_pending = True  # 第一个待下载集不需要滑动
 
     for task in tqdm(plan, desc="下载进度"):
         if task["status"] == "done":
+            if not is_first_pending:
+                logger.info(f"[第{task['ep']}集] 已完成，切集跳过")
+                advance_to_next_episode(state)
             continue
 
         ep_num = task["ep"]
-        try:
-            result = download_episode(ep_num, state, output_dir, drama_name)
-        except frida.InvalidOperationError:
-            logger.warning(f"[第{ep_num}集] Frida session 断开，恢复...")
-            session, script, pid = recover_frida(state, drama_name)
-            result = download_episode(ep_num, state, output_dir, drama_name)
+        result = None
+
+        if is_first_pending:
+            # 首集：搜索流程已导航到播放器，Hook 数据已在搜索阶段捕获
+            is_first_pending = False
+            ref, url, key = state.get_latest()
+            if ref and url and key:
+                logger.info(f"[第{ep_num}集] 使用已捕获数据 (vid={ref.video_id[:16]}...)")
+                vid8 = ref.video_id[-8:] if len(ref.video_id) >= 8 else ref.video_id
+                output_path = os.path.join(output_dir, f"episode_{ep_num:03d}_{vid8}.mp4")
+                if download_and_decrypt(url, key.key_hex, output_path) and verify_playable(output_path):
+                    result = {"success": True, "ep": ep_num, "video_id": ref.video_id, "path": output_path}
+                else:
+                    if os.path.exists(output_path):
+                        os.remove(output_path)
+            if result is None:
+                logger.warning(f"[第{ep_num}集] 已捕获数据不可用，尝试围栏捕获")
+                fence_ts = time.time() - 60
+                try:
+                    result = download_current_episode(ep_num, state, output_dir, fence_ts)
+                except frida.InvalidOperationError:
+                    session, script, pid = recover_frida(state, drama_name)
+                    result = download_current_episode(ep_num, state, output_dir, time.time())
+        else:
+            # 后续集：多策略切集 → 围栏捕获 → 下载
+            try:
+                advanced = advance_to_next_episode(state)
+                if advanced:
+                    # 切集成功，用最新 Hook 数据下载
+                    ref, url, key = state.get_latest()
+                    if ref and url and key:
+                        vid8 = ref.video_id[-8:] if len(ref.video_id) >= 8 else ref.video_id
+                        output_path = os.path.join(output_dir, f"episode_{ep_num:03d}_{vid8}.mp4")
+                        if download_and_decrypt(url, key.key_hex, output_path) and verify_playable(output_path):
+                            result = {"success": True, "ep": ep_num, "video_id": ref.video_id, "path": output_path}
+                        else:
+                            if os.path.exists(output_path):
+                                os.remove(output_path)
+                if result is None:
+                    # 切集失败或下载失败，尝试围栏捕获
+                    fence_ts = time.time() - 5
+                    result = download_current_episode(ep_num, state, output_dir, fence_ts)
+            except frida.InvalidOperationError:
+                logger.warning(f"[第{ep_num}集] Frida session 断开，恢复...")
+                session, script, pid = recover_frida(state, drama_name)
+                result = download_current_episode(ep_num, state, output_dir, time.time())
+
+        if result is None:
+            result = {"success": False, "ep": ep_num, "video_id": "", "path": ""}
 
         if result["success"]:
             success_count += 1
