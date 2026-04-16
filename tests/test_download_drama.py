@@ -1205,5 +1205,93 @@ class TestSessionManifestFormat(unittest.TestCase):
             self.assertEqual(completed, {1, 2})
 
 
+class AdapterIntegrationTests(unittest.TestCase):
+    """测试 AppAdapter 集成到 download_drama.py 主流程"""
+
+    def test_load_config_success(self):
+        """测试配置文件加载成功"""
+        import tempfile
+        import yaml
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False, encoding='utf-8') as f:
+            yaml.dump({'app': 'honguo', 'apps': {'honguo': {'package': 'com.phoenix.read'}}}, f)
+            temp_path = f.name
+
+        try:
+            config = download_drama.load_config(temp_path)
+            self.assertEqual(config['app'], 'honguo')
+            self.assertIn('apps', config)
+        finally:
+            Path(temp_path).unlink()
+
+    def test_load_config_missing_file(self):
+        """测试配置文件不存在时返回默认配置"""
+        config = download_drama.load_config("nonexistent_config.yaml")
+        self.assertEqual(config, {"app": "honguo"})
+
+    def test_adapter_initialization(self):
+        """测试 adapter 初始化和全局访问"""
+        from scripts.app_adapter import create_adapter
+
+        adapter = create_adapter('honguo')
+        download_drama.set_adapter(adapter)
+
+        retrieved_adapter = download_drama.get_adapter()
+        self.assertIsNotNone(retrieved_adapter)
+        self.assertEqual(retrieved_adapter.get_package_name(), 'com.phoenix.read')
+
+    def test_get_adapter_before_initialization_raises_error(self):
+        """测试在初始化前访问 adapter 抛出错误"""
+        # 重置全局 adapter
+        download_drama._adapter_instance = None
+
+        with self.assertRaises(RuntimeError) as ctx:
+            download_drama.get_adapter()
+
+        self.assertIn("not initialized", str(ctx.exception))
+
+    def test_adapter_parse_ui_context_integration(self):
+        """测试 adapter.parse_ui_context 集成"""
+        from scripts.app_adapter import create_adapter
+
+        adapter = create_adapter('honguo')
+        download_drama.set_adapter(adapter)
+
+        # 使用 adapter 解析 UI XML
+        context = download_drama.get_adapter().parse_ui_context(SAMPLE_UI_XML)
+        self.assertEqual(context.title, "爹且慢，我来了")
+        self.assertEqual(context.episode, 3)
+        self.assertEqual(context.total_episodes, 60)
+
+    @patch('scripts.drama_download_common.select_episode_from_ui')
+    def test_adapter_select_episode_integration(self, mock_select_episode):
+        """测试 adapter.select_episode 集成"""
+        from scripts.app_adapter import create_adapter
+
+        adapter = create_adapter('honguo')
+        download_drama.set_adapter(adapter)
+
+        # 模拟 select_episode_from_ui 返回成功
+        mock_select_episode.return_value = True
+
+        # 调用 adapter.select_episode
+        success = download_drama.get_adapter().select_episode(3, max_attempts=5)
+
+        # 验证 select_episode_from_ui 被调用，参数正确
+        self.assertTrue(success)
+        mock_select_episode.assert_called_once_with(3, max_attempts=5)
+
+    def test_backward_compatibility_without_config(self):
+        """测试向后兼容：无配置文件时使用默认 honguo adapter"""
+        from scripts.app_adapter import create_adapter
+
+        # 加载不存在的配置文件（返回默认配置）
+        config = download_drama.load_config("nonexistent.yaml")
+        adapter = create_adapter(config['app'])
+
+        self.assertEqual(adapter.get_package_name(), 'com.phoenix.read')
+        self.assertEqual(adapter.get_hook_script(), 'frida_hooks/ttengine_all.js')
+
+
 if __name__ == "__main__":
     unittest.main()
