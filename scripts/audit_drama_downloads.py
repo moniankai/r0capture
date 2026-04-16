@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -9,6 +10,8 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts.drama_download_common import build_episode_base_name, sanitize_drama_name, video_id_suffix
+
+_VIDEO_NAME_RE = re.compile(r'^episode_(\d{3})_([a-z0-9]+)\.mp4$', re.IGNORECASE)
 
 
 def load_metadata(path: str | Path) -> dict[str, Any]:
@@ -34,6 +37,15 @@ def analyze_drama_directory(
     duplicates: dict[str, list[dict[str, Any]]] = defaultdict(list)
     rename_plan: list[dict[str, Any]] = []
     missing_video_for_meta: list[str] = []
+    episodes_from_filename: list[int] = []
+    video_ids_from_filename: dict[int, str] = {}
+
+    for video_path in video_files:
+        match = _VIDEO_NAME_RE.match(video_path.name)
+        if match:
+            ep = int(match.group(1))
+            episodes_from_filename.append(ep)
+            video_ids_from_filename[ep] = match.group(2)
 
     for meta_path in meta_files:
         data = load_metadata(meta_path)
@@ -77,7 +89,15 @@ def analyze_drama_directory(
     if expected_total_episodes is None and total_candidates:
         expected_total_episodes = Counter(total_candidates).most_common(1)[0][0]
 
-    episodes_present = sorted({entry['episode'] for entry in entries if entry['episode']})
+    meta_episodes = {entry['episode'] for entry in entries if entry['episode']}
+    filename_episodes = set(episodes_from_filename)
+    episodes_present = sorted(meta_episodes | filename_episodes)
+    episodes_without_meta = sorted(filename_episodes - meta_episodes)
+    duplicate_filename_video_ids = {
+        vid: [ep for ep, v in video_ids_from_filename.items() if v == vid]
+        for vid in {v for v in video_ids_from_filename.values()}
+        if sum(1 for v in video_ids_from_filename.values() if v == vid) > 1
+    }
     missing_episodes: list[int] = []
     if expected_total_episodes:
         for number in range(1, expected_total_episodes + 1):
@@ -148,6 +168,8 @@ def analyze_drama_directory(
         'folder_name_mismatch': folder_name_mismatch,
         'expected_total_episodes': expected_total_episodes,
         'episodes_present': episodes_present,
+        'episodes_without_meta': episodes_without_meta,
+        'duplicate_filename_video_ids': duplicate_filename_video_ids,
         'missing_episodes': missing_episodes,
         'drama_name_mismatches': drama_name_mismatches,
         'duplicate_video_ids': duplicate_video_ids,

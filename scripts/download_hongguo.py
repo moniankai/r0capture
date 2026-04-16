@@ -445,56 +445,79 @@ def build_plan(output_dir: str, total_eps: int, start_ep: int = 1) -> list[dict]
     return plan
 
 
-def advance_to_next_episode(state: HookState, prev_video_id: str = "",
-                            timeout: float = 8.0) -> bool:
-    """切换到下一集，等待出现不同 video_id 的 Hook 数据
+# 剧集 duration 合理范围（秒）：短于此为广告/片头，长于此为连播模式
+EPISODE_DURATION_MIN = 30
+EPISODE_DURATION_MAX = 600
 
-    通过比对 video_id 而非简单计数来判断是否真正换集，
-    避免同一集多画质触发多次 setVideoModel 导致误判。
+
+def advance_to_next_episode(state: HookState, prev_video_id: str = "",
+                            downloaded_vids: set[str] | None = None,
+                            timeout: float = 8.0,
+                            max_swipes: int = 2) -> bool:
+    """上滑切换到下一集，等待合法的新剧集 Hook 数据
+
+    合法判据（全部满足）：
+      1. 新 video_id != prev_video_id
+      2. 新 video_id 不在 downloaded_vids（不是历史已下过的集）
+      3. duration 在 [EPISODE_DURATION_MIN, EPISODE_DURATION_MAX]（排除广告/推荐）
+
+    红果竖屏短剧的原生切集手势是上滑，依赖单一手势避免 tap 坐标引发的广告误触。
+    每次判定不合法时会再滑一次（最多 max_swipes 次）。
 
     Args:
-        prev_video_id: 上一集的 video_id，用于去重。为空则退化为计数检测。
+        prev_video_id: 上一集的 video_id
+        downloaded_vids: 已成功下载的 video_id 集合，用于避免滑回已下集
+        timeout: 每次上滑后的等待时间
+        max_swipes: 最多滑几次（含首次）
 
-    Returns: True 表示检测到不同 video_id 的新 Hook 数据
+    Returns: True 表示检测到合法的新剧集
     """
-    old_ref_count = len(state.refs)
+    downloaded_vids = downloaded_vids or set()
 
-    def _has_new_episode() -> bool:
-        if len(state.refs) <= old_ref_count:
-            return False
-        if not prev_video_id:
-            return True
-        # 检查是否有不同于上一集的 video_id
-        for ref in state.refs[old_ref_count:]:
-            if ref.video_id != prev_video_id:
+    def _find_legit_ref(start_idx: int) -> VideoRef | None:
+        with state.lock:
+            candidates = state.refs[start_idx:]
+        for ref in candidates:
+            if ref.video_id == prev_video_id:
+                continue
+            if ref.video_id in downloaded_vids:
+                continue
+            if not (EPISODE_DURATION_MIN <= ref.duration <= EPISODE_DURATION_MAX):
+                continue
+            return ref
+        return None
+
+    for swipe_idx in range(max_swipes):
+        with state.lock:
+            old_ref_count = len(state.refs)
+
+        run_adb(["shell", "input", "swipe", "540", "1600", "540", "300", "250"])
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            legit = _find_legit_ref(old_ref_count)
+            if legit:
+                logger.info(f"[切集] 成功 (vid={legit.video_id[:16]}..., dur={legit.duration}s)")
                 return True
-        return False
+            time.sleep(0.3)
 
-    # 主策略：tap 控制层 + tap 下一集
-    run_adb(["shell", "input", "tap", "540", "960"])
-    time.sleep(0.5)
-    run_adb(["shell", "input", "tap", "960", "960"])
+        # 分析本次滑动产生了什么，决定是否继续
+        with state.lock:
+            new_refs = state.refs[old_ref_count:]
+        if not new_refs:
+            logger.warning(f"[切集] 第{swipe_idx + 1}次上滑未触发 Hook")
+        else:
+            reasons = []
+            for r in new_refs:
+                if r.video_id == prev_video_id:
+                    reasons.append(f"同上集({r.duration}s)")
+                elif r.video_id in downloaded_vids:
+                    reasons.append(f"已下过({r.video_id[-8:]})")
+                elif not (EPISODE_DURATION_MIN <= r.duration <= EPISODE_DURATION_MAX):
+                    reasons.append(f"dur异常({r.duration}s)")
+            logger.warning(f"[切集] 第{swipe_idx + 1}次上滑拿到 {len(new_refs)} 个新 ref，均不合法: {reasons}")
 
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if _has_new_episode():
-            new_ref = state.refs[-1]
-            logger.info(f"[切集] 成功 (vid={new_ref.video_id[:16]}...)")
-            return True
-        time.sleep(0.3)
-
-    # fallback：上滑
-    logger.info("[切集] tap 未触发，尝试上滑")
-    run_adb(["shell", "input", "swipe", "540", "1600", "540", "300", "250"])
-    deadline = time.time() + 5
-    while time.time() < deadline:
-        if _has_new_episode():
-            new_ref = state.refs[-1]
-            logger.info(f"[切集] 成功-上滑 (vid={new_ref.video_id[:16]}...)")
-            return True
-        time.sleep(0.3)
-
-    logger.warning("[切集] 未触发新 Hook 数据")
+    logger.error(f"[切集] {max_swipes} 次上滑后仍未拿到合法剧集")
     return False
 
 
@@ -700,13 +723,26 @@ def main():
     last_video_id = ""     # 上一集的 video_id，用于 advance 去重
     downloaded_vids: set[str] = set()  # 所有已下载的 video_id，防止隔集重复
 
+    # 加载已有 manifest 的成功记录，避免跨 session 重复 append
+    recorded_ok: set[tuple[int, str]] = set()
+    if os.path.exists(manifest_path):
+        with open(manifest_path, encoding="utf-8") as _f:
+            for _line in _f:
+                try:
+                    _rec = json.loads(_line)
+                    if _rec.get("status") == "ok":
+                        recorded_ok.add((int(_rec["episode"]), str(_rec.get("video_id", ""))))
+                except (json.JSONDecodeError, KeyError, ValueError):
+                    continue
+
     for task in tqdm(plan, desc="下载进度"):
         ep_num = task["ep"]
 
         # 切集（跳过首集）
         if need_advance:
             try:
-                if not advance_to_next_episode(state, prev_video_id=last_video_id):
+                if not advance_to_next_episode(state, prev_video_id=last_video_id,
+                                               downloaded_vids=downloaded_vids):
                     logger.warning(f"[第{ep_num}集] 切集失败")
                     if task["status"] != "done":
                         failed_eps.append(ep_num)
@@ -769,13 +805,16 @@ def main():
 
         if result["success"]:
             success_count += 1
-            append_jsonl(manifest_path, {
-                "episode": result["ep"],
-                "video_id": result["video_id"],
-                "path": result["path"],
-                "timestamp": time.time(),
-                "status": "ok",
-            })
+            key_tuple = (result["ep"], result["video_id"])
+            if key_tuple not in recorded_ok:
+                append_jsonl(manifest_path, {
+                    "episode": result["ep"],
+                    "video_id": result["video_id"],
+                    "path": result["path"],
+                    "timestamp": time.time(),
+                    "status": "ok",
+                })
+                recorded_ok.add(key_tuple)
         else:
             failed_eps.append(ep_num)
 
