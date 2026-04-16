@@ -1851,6 +1851,7 @@ def main() -> None:
     # output_dir 在首次捕获后解析，因为 drama_name 可能需要自动识别
     output_dir = ""
     session_manifest_path = ""
+    completed_episodes: set[int] = set()
 
     def resolve_output_dir(ui_context: UIContext | None = None) -> str:
         """确定输出目录，必要时自动识别并清洗剧名。"""
@@ -1871,6 +1872,15 @@ def main() -> None:
         output_dir = os.path.join(output_root, safe_name)
         os.makedirs(output_dir, exist_ok=True)
         session_manifest_path = os.path.join(output_dir, "session_manifest.jsonl")
+
+        # 断点续传：加载已完成集数
+        nonlocal completed_episodes
+        if os.path.exists(session_manifest_path):
+            from scripts.drama_download_common import parse_session_manifest
+            completed_episodes = parse_session_manifest(session_manifest_path)
+            if completed_episodes:
+                logger.info(f"[断点续传] 检测到 {len(completed_episodes)} 个已完成集数: {sorted(completed_episodes)}")
+
         return output_dir
 
     def update_total_episodes(ui_total: int | None) -> tuple[int | None, str]:
@@ -2047,6 +2057,18 @@ def main() -> None:
 
     def download_and_decrypt(ep_num: int) -> dict:
         """在 UI 校验后下载并解密当前捕获的视频。"""
+        # 断点续传：检查集数是否已完成
+        if ep_num in completed_episodes:
+            logger.info(f"[断点续传] 第 {ep_num} 集已完成，跳过")
+            # 记录跳过事件到 session_manifest.jsonl
+            append_jsonl(session_manifest_path, {
+                "episode": ep_num,
+                "status": "skipped_resume",
+                "timestamp": time.time(),
+                "reason": "already_completed"
+            })
+            return {"success": True, "reason": "skipped_resume", "episode": ep_num}
+
         ui_context = detect_ui_context_from_device()
         if ui_context.episode is None:
             run_adb(["shell", "input", "tap", "540", "960"])

@@ -177,6 +177,28 @@ def _parse_total_value(text: str) -> Optional[int]:
     return None
 
 
+def _parse_selected_episode_from_grid(xml_text: str) -> Optional[int]:
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return None
+
+    parent_map = {child: parent for parent in root.iter() for child in parent}
+    for elem in root.iter():
+        if elem.attrib.get('resource-id', '') != 'com.phoenix.read:id/ivi':
+            continue
+        text = (elem.attrib.get('text') or '').strip()
+        if not text.isdigit():
+            continue
+        parent = parent_map.get(elem)
+        if parent is None:
+            continue
+        for child in parent.iter():
+            if child.attrib.get('resource-id', '') == 'com.phoenix.read:id/zu':
+                return int(text)
+    return None
+
+
 def _looks_like_title(text: str) -> bool:
     if not text or text in SKIP_TITLE_TEXTS:
         return False
@@ -233,6 +255,8 @@ def parse_ui_context(xml_text: str) -> UIContext:
             episode = _parse_episode_value(node['text'])
             if episode is not None:
                 break
+    if episode is None:
+        episode = _parse_selected_episode_from_grid(xml_text)
 
     for node in nodes:
         text = node['text']
@@ -270,8 +294,9 @@ def build_episode_paths(
     output_dir: str, episode: int, video_id: str, drama_name: str = ''
 ) -> tuple[str, str]:
     folder_name = os.path.basename(output_dir) if not drama_name else drama_name
-    video_path = os.path.join(output_dir, f'{folder_name}_episode_{episode:03d}.mp4')
-    meta_path = os.path.join(output_dir, f'meta_ep{episode:03d}.json')
+    suffix = video_id_suffix(video_id)
+    video_path = os.path.join(output_dir, f'{folder_name}_episode_{episode:03d}_{suffix}.mp4')
+    meta_path = os.path.join(output_dir, f'meta_ep{episode:03d}_{suffix}.json')
     return video_path, meta_path
 
 
@@ -355,3 +380,41 @@ def append_jsonl(path: str | Path, payload: dict) -> None:
 
         fh.write(json.dumps(payload, ensure_ascii=False))
         fh.write('\n')
+
+
+def parse_session_manifest(manifest_path: str | Path) -> set[int]:
+    """解析 session_manifest.jsonl，返回已完成的集数集合。
+
+    Args:
+        manifest_path: session_manifest.jsonl 文件路径
+
+    Returns:
+        已完成的集数集合（episode 字段值）
+    """
+    import json
+    import logging
+
+    logger = logging.getLogger(__name__)
+    target = Path(manifest_path)
+
+    if not target.exists():
+        return set()
+
+    completed = set()
+    with target.open('r', encoding='utf-8') as fh:
+        for line_num, line in enumerate(fh, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+                status = record.get('status', '')
+                if status in ('downloaded', 'skipped_existing'):
+                    episode = record.get('episode')
+                    if isinstance(episode, int):
+                        completed.add(episode)
+            except json.JSONDecodeError as e:
+                logger.warning(f"跳过 session_manifest.jsonl 第 {line_num} 行（格式错误）: {e}")
+                continue
+
+    return completed

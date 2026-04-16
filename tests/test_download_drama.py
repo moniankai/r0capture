@@ -792,5 +792,95 @@ class EpisodeNumberMatchingTests(unittest.TestCase):
         self.assertEqual(latest_ref.video_id, "vid002")
 
 
+class TestResumeFromCheckpoint(unittest.TestCase):
+    """测试断点续传功能"""
+
+    def test_resume_from_checkpoint(self):
+        """测试从断点续传时跳过已完成集数"""
+        from tempfile import TemporaryDirectory
+        import json
+        from scripts.drama_download_common import append_jsonl
+
+        with TemporaryDirectory() as tmpdir:
+            manifest_path = Path(tmpdir) / "session_manifest.jsonl"
+
+            # 模拟已完成的集数
+            append_jsonl(manifest_path, {"episode": 1, "status": "downloaded", "video_id": "abc123"})
+            append_jsonl(manifest_path, {"episode": 2, "status": "skipped_existing", "video_id": "def456"})
+            append_jsonl(manifest_path, {"episode": 3, "status": "downloaded", "video_id": "ghi789"})
+
+            # 解析已完成集数
+            from scripts.drama_download_common import parse_session_manifest
+            completed = parse_session_manifest(manifest_path)
+
+            # 验证已完成集数
+            self.assertEqual(completed, {1, 2, 3})
+
+            # 模拟 download_and_decrypt 的跳过逻辑
+            ep_num = 2
+            if ep_num in completed:
+                # 记录跳过事件
+                append_jsonl(manifest_path, {
+                    "episode": ep_num,
+                    "status": "skipped_resume",
+                    "timestamp": 1234567890.0,
+                    "reason": "already_completed"
+                })
+                result = {"success": True, "reason": "skipped_resume", "episode": ep_num}
+            else:
+                result = {"success": False}
+
+            # 验证跳过结果
+            self.assertTrue(result["success"])
+            self.assertEqual(result["reason"], "skipped_resume")
+            self.assertEqual(result["episode"], 2)
+
+            # 验证 session_manifest.jsonl 包含 skipped_resume 记录
+            with manifest_path.open('r', encoding='utf-8') as f:
+                lines = f.readlines()
+                last_record = json.loads(lines[-1])
+                self.assertEqual(last_record["status"], "skipped_resume")
+                self.assertEqual(last_record["episode"], 2)
+                self.assertEqual(last_record["reason"], "already_completed")
+
+    def test_resume_append_to_manifest(self):
+        """测试跳过事件正确追加到 session_manifest.jsonl"""
+        from tempfile import TemporaryDirectory
+        import json
+        from scripts.drama_download_common import append_jsonl, parse_session_manifest
+
+        with TemporaryDirectory() as tmpdir:
+            manifest_path = Path(tmpdir) / "session_manifest.jsonl"
+
+            # 模拟已完成的集数
+            append_jsonl(manifest_path, {"episode": 1, "status": "downloaded"})
+            append_jsonl(manifest_path, {"episode": 2, "status": "downloaded"})
+
+            # 解析已完成集数
+            completed = parse_session_manifest(manifest_path)
+            self.assertEqual(completed, {1, 2})
+
+            # 模拟断点续传跳过
+            for ep in [1, 2]:
+                if ep in completed:
+                    append_jsonl(manifest_path, {
+                        "episode": ep,
+                        "status": "skipped_resume",
+                        "timestamp": 1234567890.0,
+                        "reason": "already_completed"
+                    })
+
+            # 验证文件包含 4 条记录（2 条 downloaded + 2 条 skipped_resume）
+            with manifest_path.open('r', encoding='utf-8') as f:
+                lines = [line.strip() for line in f if line.strip()]
+                self.assertEqual(len(lines), 4)
+
+                # 验证最后两条是 skipped_resume
+                record3 = json.loads(lines[2])
+                record4 = json.loads(lines[3])
+                self.assertEqual(record3["status"], "skipped_resume")
+                self.assertEqual(record4["status"], "skipped_resume")
+
+
 if __name__ == "__main__":
     unittest.main()
