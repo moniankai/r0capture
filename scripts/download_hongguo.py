@@ -180,3 +180,133 @@ def setup_frida(package: str, state: HookState) -> tuple:
     time.sleep(15)
 
     return session, script, pid
+
+
+def _wait_and_dump(delay: float = 1.5, retries: int = 3) -> str:
+    """等待 UI 稳定后 dump XML，带重试"""
+    time.sleep(delay)
+    for attempt in range(retries):
+        xml = read_ui_xml_from_device()
+        if xml:
+            return xml
+        logger.warning(f"[UI] dump 失败，重试 ({attempt + 1}/{retries})")
+        run_adb(["shell", "input", "tap", "540", "960"])
+        time.sleep(1.5)
+    return ""
+
+
+def navigate_to_offline_cache() -> bool:
+    """从 App 首页导航到离线缓存页面
+
+    路径：首页 → 我的 → 设置 → 离线缓存
+    返回 True 表示成功到达离线缓存页
+    """
+    # 步骤 1：确认在首页
+    logger.info("[导航] 等待首页加载...")
+    xml = _wait_and_dump(delay=3.0)
+    if not xml:
+        logger.error("[导航] 无法获取首页 UI")
+        return False
+
+    # 步骤 2：点击"我的" Tab
+    logger.info("[导航] 点击「我的」...")
+    for attempt in range(3):
+        bounds = find_text_bounds(xml, "我的")
+        if bounds:
+            tap_bounds(bounds)
+            xml = _wait_and_dump()
+            break
+        logger.warning(f"[导航] 未找到「我的」，重试 ({attempt + 1}/3)")
+        xml = _wait_and_dump()
+    else:
+        logger.error("[导航] 无法找到「我的」Tab")
+        return False
+
+    # 步骤 3：点击设置图标
+    logger.info("[导航] 点击「设置」...")
+    for attempt in range(3):
+        bounds = find_text_bounds(xml, "设置")
+        if not bounds:
+            bounds = find_content_desc_bounds(xml, "设置")
+        if bounds:
+            tap_bounds(bounds)
+            xml = _wait_and_dump()
+            break
+        if attempt == 0:
+            run_adb(["shell", "input", "tap", "1020", "144"])
+            xml = _wait_and_dump()
+            if find_text_bounds(xml, "离线缓存"):
+                break
+        logger.warning(f"[导航] 未找到「设置」，重试 ({attempt + 1}/3)")
+        xml = _wait_and_dump()
+    else:
+        logger.error("[导航] 无法找到设置入口")
+        return False
+
+    # 步骤 4：点击"离线缓存"
+    logger.info("[导航] 点击「离线缓存」...")
+    for attempt in range(3):
+        bounds = find_text_bounds(xml, "离线缓存")
+        if bounds:
+            tap_bounds(bounds)
+            xml = _wait_and_dump()
+            if find_text_bounds(xml, "已下载") or find_text_bounds(xml, "下载中"):
+                logger.info("[导航] 已到达离线缓存页")
+                return True
+            break
+        run_adb(["shell", "input", "swipe", "540", "1500", "540", "800", "300"])
+        xml = _wait_and_dump()
+    else:
+        logger.error("[导航] 无法找到「离线缓存」")
+        return False
+
+    return True
+
+
+def enter_drama_from_cache(drama_name: str) -> bool:
+    """在离线缓存页面找到目标剧并点击进入播放器"""
+    logger.info(f"[导航] 在缓存中查找《{drama_name}》...")
+    for attempt in range(3):
+        xml = _wait_and_dump(delay=1.0)
+        if not xml:
+            continue
+        bounds = find_text_contains_bounds(xml, drama_name)
+        if bounds:
+            tap_bounds(bounds)
+            logger.info(f"[导航] 已点击《{drama_name}》")
+            time.sleep(3)
+            ctx = read_ui_episode()
+            if ctx is not None:
+                logger.info(f"[导航] 已进入播放器，当前第 {ctx} 集")
+                return True
+            logger.warning("[导航] 点击后未进入播放器，重试")
+        else:
+            logger.warning(f"[导航] 未找到《{drama_name}》({attempt + 1}/3)")
+    logger.error(f"[导航] 在离线缓存中找不到《{drama_name}》")
+    return False
+
+
+def read_ui_episode() -> int | None:
+    """从 UI 读取当前播放集数，带 tap 唤醒重试"""
+    for attempt in range(3):
+        xml = read_ui_xml_from_device()
+        if xml:
+            ctx = parse_ui_context(xml)
+            if ctx.episode is not None:
+                return ctx.episode
+        run_adb(["shell", "input", "tap", "540", "960"])
+        time.sleep(1.5)
+    return None
+
+
+def read_ui_total_episodes() -> int | None:
+    """从 UI 读取总集数"""
+    for attempt in range(3):
+        xml = read_ui_xml_from_device()
+        if xml:
+            ctx = parse_ui_context(xml)
+            if ctx.total_episodes is not None:
+                return ctx.total_episodes
+        run_adb(["shell", "input", "tap", "540", "960"])
+        time.sleep(1.5)
+    return None
