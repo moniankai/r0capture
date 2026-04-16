@@ -65,3 +65,78 @@ def test_hookstate_quality_ordering():
 
     ref, url, key = state.get_after_fence(fence_ts)
     assert url == "http://720"
+
+
+def test_on_message_video_ref():
+    from scripts.download_hongguo import HookState, create_on_message
+    state = HookState()
+    handler = create_on_message(state)
+    handler({"type": "send", "payload": {
+        "t": "video_ref",
+        "data": {"mVideoId": "v_test_123", "mVideoDuration": "90"},
+        "episode_number": 3,
+    }}, None)
+    assert len(state.refs) == 1
+    assert state.refs[0].video_id == "v_test_123"
+    assert state.refs[0].duration == 90
+    assert state.current_video_id == "v_test_123"
+
+
+def test_on_message_video_info():
+    from scripts.download_hongguo import HookState, create_on_message
+    state = HookState()
+    handler = create_on_message(state)
+    handler({"type": "send", "payload": {
+        "t": "video_ref",
+        "data": {"mVideoId": "v_abc", "mVideoDuration": "60"},
+    }}, None)
+    handler({"type": "send", "payload": {
+        "t": "video_info",
+        "idx": 0,
+        "data": {"mMainUrl": "https://cdn/video.mp4", "mResolution": "1080p", "mKid": "kid123"},
+    }}, None)
+    assert len(state.urls) == 1
+    assert state.urls[0].video_id == "v_abc"
+    assert state.urls[0].url == "https://cdn/video.mp4"
+    assert state.urls[0].quality == "1080p"
+
+
+def test_on_message_aes_key():
+    from scripts.download_hongguo import HookState, create_on_message
+    state = HookState()
+    handler = create_on_message(state)
+    handler({"type": "send", "payload": {
+        "t": "AES_KEY",
+        "key": "abcd1234abcd1234abcd1234abcd1234",
+        "bits": 128,
+        "dec": 0,
+        "episode_number": 1,
+    }}, None)
+    assert len(state.keys) == 1
+    assert state.keys[0].key_hex == "abcd1234abcd1234abcd1234abcd1234"
+    assert state.keys[0].bits == 128
+
+
+def test_on_message_ignores_non_send():
+    from scripts.download_hongguo import HookState, create_on_message
+    state = HookState()
+    handler = create_on_message(state)
+    handler({"type": "error", "description": "something"}, None)
+    assert len(state.refs) == 0
+    assert len(state.keys) == 0
+
+
+def test_on_message_video_info_empty_url_ignored():
+    from scripts.download_hongguo import HookState, create_on_message
+    state = HookState()
+    handler = create_on_message(state)
+    handler({"type": "send", "payload": {
+        "t": "video_ref",
+        "data": {"mVideoId": "v1"},
+    }}, None)
+    handler({"type": "send", "payload": {
+        "t": "video_info",
+        "idx": 0,
+        "data": {"mMainUrl": "", "mResolution": "360p"},
+    }}, None)
+    assert len(state.urls) == 0

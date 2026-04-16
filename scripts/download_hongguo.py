@@ -101,3 +101,82 @@ class HookState:
             self.refs.clear()
             self.urls.clear()
             self.keys.clear()
+
+
+def create_on_message(state: HookState):
+    """创建 on_message 回调闭包，解析 video_ref / video_info / AES_KEY 消息"""
+
+    def on_message(msg, data):
+        if msg.get("type") != "send":
+            return
+        p = msg.get("payload", {})
+        ts = time.time()
+        t = p.get("t", "")
+
+        if t == "video_ref":
+            vid = p.get("data", {}).get("mVideoId", "")
+            try:
+                dur = int(p.get("data", {}).get("mVideoDuration", 0))
+            except (ValueError, TypeError):
+                dur = 0
+            with state.lock:
+                state.current_video_id = vid
+                state.refs.append(VideoRef(video_id=vid, duration=dur, timestamp=ts))
+            logger.info(f"[Hook] video_ref: {vid} ({dur}s)")
+
+        elif t == "video_info":
+            d = p.get("data", {})
+            url = d.get("mMainUrl", "")
+            if url:
+                with state.lock:
+                    state.urls.append(VideoURL(
+                        video_id=state.current_video_id,
+                        url=url,
+                        quality=d.get("mResolution", ""),
+                        kid=d.get("mKid", ""),
+                        timestamp=ts,
+                    ))
+
+        elif t == "AES_KEY":
+            with state.lock:
+                state.keys.append(AESKey(
+                    key_hex=p["key"],
+                    bits=p.get("bits", 128),
+                    timestamp=ts,
+                ))
+            logger.info(f"[Hook] AES_KEY: {p['key'][:8]}... ({p.get('bits')}bit)")
+
+        elif t == "lib_loaded":
+            logger.info("[Hook] libttffmpeg.so 已加载")
+        elif t == "aes_hooked":
+            logger.info("[Hook] av_aes_init 已挂钩")
+        elif t == "java_ready":
+            logger.info("[Hook] Java Hook 就绪")
+
+    return on_message
+
+
+def setup_frida(package: str, state: HookState) -> tuple:
+    """Spawn App + 加载 COMBINED_HOOK，返回 (session, script, pid)"""
+    device = frida.get_usb_device()
+
+    # 先停止 App
+    env = {**os.environ, "MSYS_NO_PATHCONV": "1"}
+    subprocess.run(["adb", "shell", "am", "force-stop", package],
+                   capture_output=True, check=False, env=env)
+    time.sleep(1)
+
+    pid = device.spawn([package])
+    session = device.attach(pid)
+
+    script = session.create_script(COMBINED_HOOK)
+    script.on("message", create_on_message(state))
+    script.load()
+
+    device.resume(pid)
+    logger.info(f"[Frida] App spawned, PID={pid}")
+
+    # 等待 Hook 就绪 + App 首页加载
+    time.sleep(15)
+
+    return session, script, pid
