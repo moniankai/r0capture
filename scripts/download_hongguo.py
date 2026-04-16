@@ -87,7 +87,7 @@ class HookState:
                 matching = [u for u in self.urls
                             if u.video_id == ref.video_id and u.timestamp > fence_ts]
                 if matching:
-                    matching.sort(key=lambda u: QUALITY_ORDER.get(u.quality, 0), reverse=True)
+                    matching.sort(key=lambda u: QUALITY_ORDER.get(u.quality, 0))
                     best_url = matching[0].url
             return ref, best_url, key
 
@@ -100,7 +100,7 @@ class HookState:
             if ref:
                 matching = [u for u in self.urls if u.video_id == ref.video_id]
                 if matching:
-                    matching.sort(key=lambda u: QUALITY_ORDER.get(u.quality, 0), reverse=True)
+                    matching.sort(key=lambda u: QUALITY_ORDER.get(u.quality, 0))
                     best_url = matching[0].url
             return ref, best_url, key
 
@@ -697,7 +697,8 @@ def main():
     success_count = 0
     failed_eps = []
     need_advance = False  # 首集无需切集，后续每集都需要
-    last_video_id = ""     # 上一集的 video_id，用于去重
+    last_video_id = ""     # 上一集的 video_id，用于 advance 去重
+    downloaded_vids: set[str] = set()  # 所有已下载的 video_id，防止隔集重复
 
     for task in tqdm(plan, desc="下载进度"):
         ep_num = task["ep"]
@@ -731,9 +732,9 @@ def main():
         result = None
 
         if ref and url and key:
-            # 去重检查：如果 get_latest 返回的 video_id 和上一集相同，说明是多画质重复
-            if ref.video_id == last_video_id and last_video_id:
-                logger.warning(f"[第{ep_num}集] video_id 与上一集重复 ({ref.video_id[:16]}...)，跳过")
+            # 去重检查：video_id 不能和任何已下载集重复
+            if ref.video_id in downloaded_vids:
+                logger.warning(f"[第{ep_num}集] video_id 重复 ({ref.video_id[:16]}...)，跳过")
                 failed_eps.append(ep_num)
                 continue
 
@@ -744,6 +745,7 @@ def main():
                     and verify_playable(output_path, expected_duration=expected_dur):
                 result = {"success": True, "ep": ep_num, "video_id": ref.video_id, "path": output_path}
                 last_video_id = ref.video_id
+                downloaded_vids.add(ref.video_id)
             else:
                 if os.path.exists(output_path):
                     os.remove(output_path)
@@ -754,11 +756,13 @@ def main():
                 result = download_current_episode(ep_num, state, output_dir, time.time() - 30)
                 if result and result.get("success"):
                     last_video_id = result.get("video_id", "")
+                    downloaded_vids.add(last_video_id)
             except frida.InvalidOperationError:
                 session, script, pid = recover_frida(state, drama_name)
                 result = download_current_episode(ep_num, state, output_dir, time.time())
                 if result and result.get("success"):
                     last_video_id = result.get("video_id", "")
+                    downloaded_vids.add(last_video_id)
 
         if result is None:
             result = {"success": False, "ep": ep_num, "video_id": "", "path": ""}

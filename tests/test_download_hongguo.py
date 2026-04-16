@@ -46,7 +46,7 @@ def test_hookstate_get_after_fence_returns_new_data():
     ref, url, key = state.get_after_fence(fence_ts)
     assert ref is not None
     assert ref.video_id == "new_vid"
-    assert url == "http://new/1080p"
+    assert url == "http://new/360p"  # 低画质优先
     assert key is not None
     assert key.key_hex == "a" * 32
 
@@ -64,7 +64,7 @@ def test_hookstate_quality_ordering():
         state.keys.append(AESKey(key_hex="b" * 32, bits=128, timestamp=ts))
 
     ref, url, key = state.get_after_fence(fence_ts)
-    assert url == "http://720"
+    assert url == "http://360"  # 低画质优先
 
 
 def test_on_message_video_ref():
