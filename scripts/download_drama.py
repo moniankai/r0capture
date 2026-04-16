@@ -2363,6 +2363,59 @@ def main() -> None:
 
         return {"success": True, "episode": actual_episode, "total_episodes": ui_context.total_episodes}
 
+    def download_with_retry(ep_num: int, max_retries: int = 3) -> dict:
+        """包装 download_and_decrypt()，增加自动重试逻辑。
+
+        Args:
+            ep_num: 集数
+            max_retries: 最大重试次数（默认 3 次）
+
+        Returns:
+            download_and_decrypt() 的返回值（最后一次尝试的结果）
+        """
+        nonlocal session_manifest_path
+
+        result = {}
+        for attempt in range(max_retries):
+            if attempt > 0:
+                logger.warning(f"[重试] 第 {ep_num} 集下载失败，开始第 {attempt + 1}/{max_retries} 次重试")
+                # 重试前清空 Hook 数据状态
+                reset_capture_state()
+                logger.debug(f"[重试] 已清空 CaptureState，等待 2 秒后重试")
+                time.sleep(2)
+
+            result = download_and_decrypt(ep_num)
+
+            # 记录重试历史到 session_manifest.jsonl
+            if attempt > 0 or not result.get("success", False):
+                append_jsonl(session_manifest_path, {
+                    "episode": ep_num,
+                    "status": "retry_attempt" if not result.get("success", False) else "retry_success",
+                    "attempt": attempt + 1,
+                    "max_retries": max_retries,
+                    "reason": result.get("reason", "unknown"),
+                    "error": result.get("error", None),
+                    "timestamp": time.time()
+                })
+
+            # 成功或跳过（skipped_resume）则返回
+            if result.get("success", False):
+                return result
+
+            # 最后一次尝试失败，记录最终失败状态
+            if attempt == max_retries - 1:
+                logger.error(f"[重试] 第 {ep_num} 集重试 {max_retries} 次后仍失败: {result.get('reason', 'unknown')}")
+                append_jsonl(session_manifest_path, {
+                    "episode": ep_num,
+                    "status": "failed_after_retries",
+                    "max_retries": max_retries,
+                    "final_reason": result.get("reason", "unknown"),
+                    "final_error": result.get("error", None),
+                    "timestamp": time.time()
+                })
+
+        return result
+
     if args.search:
         logger.info(f"\n等待第 {current_ep} 集数据捕获（视频应已自动开始）...")
     else:
@@ -2376,7 +2429,7 @@ def main() -> None:
             pass
         return
 
-    first_result = download_and_decrypt(current_ep)
+    first_result = download_with_retry(current_ep, max_retries=3)
     while not first_result.get("success") and first_result.get("reason") in {"title_mismatch", "unexpected_episode"}:
         logger.warning("启动轮次未落到目标剧/目标集；清空捕获并重新定位。")
         state.clear()
@@ -2384,7 +2437,7 @@ def main() -> None:
             search_drama_in_app(expected_drama_name, current_ep)
         if not wait_for_capture():
             break
-        first_result = download_and_decrypt(current_ep)
+        first_result = download_with_retry(current_ep, max_retries=3)
 
     if not first_result.get("success"):
         try:
@@ -2468,7 +2521,7 @@ def main() -> None:
                 logger.warning(f"[恢复] 第{expected_ep}集在选集恢复后仍未捕获到数据")
                 return False, False, "missing_capture"
             return handle_episode_result(
-                download_and_decrypt(expected_ep),
+                download_with_retry(expected_ep, max_retries=3),
                 expected_ep,
                 allow_duplicate_skip=False,
             )
@@ -2517,7 +2570,7 @@ def main() -> None:
                     break
 
                 handled, should_break, last_reason = handle_episode_result(
-                    download_and_decrypt(expected_ep),
+                    download_with_retry(expected_ep, max_retries=3),
                     expected_ep,
                     allow_duplicate_skip=False,
                 )
