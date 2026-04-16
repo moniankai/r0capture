@@ -77,7 +77,7 @@ Plans:
 **Plans**: 3 plans in 3 waves
 
 Plans:
-- [ ] 04-01-PLAN.md — AppAdapter 接口定义（抽象基类 + 工厂函数）
+- [x] 04-01-PLAN.md — AppAdapter 接口定义（抽象基类 + 工厂函数）
 - [ ] 04-02-PLAN.md — HongGuoAdapter 实现（迁移现有红果逻辑）
 - [ ] 04-03-PLAN.md — 配置文件加载和集成（config.yaml + 主流程集成）
 
