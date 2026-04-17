@@ -213,17 +213,25 @@ class State:
             self.last_new = cap
         return True
 
-    def wait_new(self, timeout: float = 3.0) -> Capture | None:
-        """等下一个 last_new（每次 cap 到来会覆盖）。返回后清空 last_new。"""
+    def wait_new(self, timeout: float = 4.0, settle: float = 1.5) -> Capture | None:
+        """等首个新 cap → 再吸收 settle 秒内的后续 fire → 返回末个。
+        App 在 tap 当前集时可能先 fire 预加载下一集，末个 cap 更可能是当前集。
+        """
         deadline = time.time() + timeout
+        first_seen_ts = None
         while time.time() < deadline:
             with self.lock:
                 if self.last_new is not None:
-                    c = self.last_new
-                    self.last_new = None
-                    return c
+                    first_seen_ts = time.time()
+                    break
             time.sleep(0.1)
-        return None
+        if first_seen_ts is None:
+            return None
+        time.sleep(settle)
+        with self.lock:
+            c = self.last_new
+            self.last_new = None
+        return c
 
     def snapshot(self, path: Path):
         with self.lock:
@@ -341,16 +349,11 @@ def scan_panel(total_eps: int) -> tuple[dict[int, tuple[int,int]], dict[str, tup
         if label in seg_btn:
             run_adb(["shell", "input", "tap", str(seg_btn[label][0]), str(seg_btn[label][1])])
             time.sleep(1.0)
-        # 先 swipe down 几次把面板回滚到段顶（RecyclerView 可能从上段位置继承）
-        for _ in range(4):
-            run_adb(["shell", "input", "swipe", "540", "1400", "540", "1800", "300"])
-            time.sleep(0.3)
         seg_hits = _scan_current_panel(lo, hi)
-        # 如果段内没拿全，swipe 面板内容向上滚动露出后续格子，最多滚 3 次
+        # 如果段内没拿全，温和地向上滑（幅度缩小，避开系统手势）：(540,1600)→(540,1400) 200px
         scroll_n = 0
         while seg_hits < expected and scroll_n < 3:
-            # 面板内容区大致 y=1300..1920；向上滑 ~500px 把后续集号滚上来
-            run_adb(["shell", "input", "swipe", "540", "1700", "540", "1200", "400"])
+            run_adb(["shell", "input", "swipe", "540", "1600", "540", "1400", "500"])
             time.sleep(0.8)
             more = _scan_current_panel(lo, hi)
             if more == 0:
