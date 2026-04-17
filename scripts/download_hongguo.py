@@ -34,8 +34,12 @@ from scripts.drama_download_common import (
     find_text_bounds,
     find_text_contains_bounds,
     find_content_desc_bounds,
+    find_element_by_resource_id,
     parse_ui_context,
     append_jsonl,
+    select_episode_from_ui,
+    _find_episode_button,
+    _select_episode_range,
 )
 from scripts.decrypt_video import decrypt_mp4, fix_metadata
 from scripts.download_drama import COMBINED_HOOK
@@ -104,6 +108,32 @@ class HookState:
                     best_url = matching[0].url
             return ref, best_url, key
 
+    def get_complete_by_vid(self, target_vid: str, timeout: float = 12.0
+                             ) -> tuple[VideoRef | None, str | None, AESKey | None]:
+        """按 video_id 精确匹配 ref 和 URL；key 用"ref 之后到达的第一个 key"，最多等 timeout 秒。
+
+        解决 get_latest 的竞态：refs[-1] 和 keys[-1] 可能不同源。
+        """
+        deadline = time.time() + timeout
+        while True:
+            with self.lock:
+                ref = next((r for r in self.refs if r.video_id == target_vid), None)
+                if not ref:
+                    break  # vid 根本没出现，直接返回
+                matching = [u for u in self.urls if u.video_id == target_vid]
+                best_url = None
+                if matching:
+                    matching.sort(key=lambda u: QUALITY_ORDER.get(u.quality, 0))
+                    best_url = matching[0].url
+                # 紧随 ref 之后的第一个 key
+                key = next((k for k in self.keys if k.timestamp >= ref.timestamp), None)
+            if ref and best_url and key:
+                return ref, best_url, key
+            if time.time() >= deadline:
+                return ref, best_url, key  # 超时也返回当前状态
+            time.sleep(0.3)
+        return None, None, None
+
     def clear(self):
         with self.lock:
             self.current_video_id = ""
@@ -165,12 +195,32 @@ def create_on_message(state: HookState):
     return on_message
 
 
-def setup_frida(package: str, state: HookState) -> tuple:
-    """Spawn App + 加载 COMBINED_HOOK，返回 (session, script, pid)"""
-    device = frida.get_usb_device(timeout=10)
+def setup_frida(package: str, state: HookState, attach_running: bool = False) -> tuple:
+    """加载 COMBINED_HOOK，返回 (session, script, pid)
 
-    # 先停止 App
+    Args:
+        attach_running: True 时 attach 到已运行 App（不 spawn），用户需手动把 App 调到目标状态
+    """
+    device = frida.get_usb_device(timeout=10)
     env = {**os.environ, "MSYS_NO_PATHCONV": "1"}
+
+    if attach_running:
+        # Attach 到已运行 App
+        from scripts.download_drama import select_running_app_pid
+        pid = select_running_app_pid(device.enumerate_processes(), package)
+        if pid is None:
+            raise RuntimeError(f"{package} 未在前台运行，无法 attach。请先在手机上打开 App 并进入全屏播放页")
+        session = device.attach(pid)
+        script = session.create_script(COMBINED_HOOK)
+        script.on("message", create_on_message(state))
+        script.load()
+        logger.info(f"[Frida] Attached running App, PID={pid}")
+        # 等待 Hook 轮询 ffmpegLoaded 的 30 秒 fallback 完成
+        logger.info("[Frida] 等待 av_aes_init Hook 就绪（最多 35 秒）...")
+        time.sleep(35)
+        return session, script, pid
+
+    # Spawn 模式
     subprocess.run(["adb", "shell", "am", "force-stop", package],
                    capture_output=True, check=False, env=env)
     time.sleep(1)
@@ -184,21 +234,14 @@ def setup_frida(package: str, state: HookState) -> tuple:
 
     device.resume(pid)
     logger.info(f"[Frida] App spawned, PID={pid}")
-
-    # 等待 Hook 就绪
     time.sleep(5)
-
-    # 确保 App 在前台（spawn 后可能在后台）
     subprocess.run(
         ["adb", "shell", "monkey", "-p", package, "-c",
          "android.intent.category.LAUNCHER", "1"],
         capture_output=True, check=False, env=env,
     )
-
-    # 等待 App 首页完全加载
     logger.info("[Frida] 等待 App 首页加载...")
     time.sleep(10)
-
     return session, script, pid
 
 
@@ -334,6 +377,47 @@ def read_ui_total_episodes() -> int | None:
     return None
 
 
+def ensure_fullscreen_player() -> bool:
+    """确保当前在全屏播放页。若识别为详情页，则 tap 顶部预览进入全屏。
+
+    判定方式：
+      - UI dump 失败 → 视频在播放（UIAutomator 拿不到 idle），大概率已全屏
+      - UI dump 成功且包含"全N集"/"写评价"/"相关推荐" → 详情页
+      - 其他情况保守认为已就绪
+    """
+    import re as _re
+    xml = _wait_and_dump(delay=1.0, retries=1)
+    if not xml:
+        logger.info("[全屏] UI dump 失败，视为已在全屏播放")
+        return True
+
+    is_detail = bool(_re.search(r'全\d+集', xml)) or '写评价' in xml or '相关推荐' in xml
+    if not is_detail:
+        logger.info("[全屏] 当前不在详情页，继续")
+        return True
+
+    logger.info("[全屏] 检测到详情页，tap 顶部预览区进入全屏...")
+    run_adb(["shell", "input", "tap", "540", "400"])
+    time.sleep(3)
+    xml2 = _wait_and_dump(delay=1.0, retries=1)
+    if not xml2:
+        logger.info("[全屏] tap 后 UI 不可 dump，成功进入全屏")
+        return True
+    still_detail = bool(_re.search(r'全\d+集', xml2)) and '写评价' in xml2
+    if still_detail:
+        logger.warning("[全屏] tap 后仍在详情页，尝试下方封面 (195, 400)")
+        run_adb(["shell", "input", "tap", "195", "400"])
+        time.sleep(3)
+        xml3 = _wait_and_dump(delay=1.0, retries=1)
+        if not xml3:
+            logger.info("[全屏] 第二次 tap 后 UI 不可 dump，成功进入全屏")
+            return True
+        logger.warning("[全屏] 两次 tap 后仍在详情页")
+        return False
+    logger.info("[全屏] 已离开详情页")
+    return True
+
+
 def wait_capture(state: HookState, fence_ts: float, timeout: float = 30.0):
     """轮询 HookState，等待围栏后 ref+url+key 三者到齐
 
@@ -453,7 +537,7 @@ EPISODE_DURATION_MAX = 600
 def advance_to_next_episode(state: HookState, prev_video_id: str = "",
                             downloaded_vids: set[str] | None = None,
                             timeout: float = 8.0,
-                            max_swipes: int = 2) -> bool:
+                            max_swipes: int = 2) -> VideoRef | None:
     """上滑切换到下一集，等待合法的新剧集 Hook 数据
 
     合法判据（全部满足）：
@@ -461,16 +545,7 @@ def advance_to_next_episode(state: HookState, prev_video_id: str = "",
       2. 新 video_id 不在 downloaded_vids（不是历史已下过的集）
       3. duration 在 [EPISODE_DURATION_MIN, EPISODE_DURATION_MAX]（排除广告/推荐）
 
-    红果竖屏短剧的原生切集手势是上滑，依赖单一手势避免 tap 坐标引发的广告误触。
-    每次判定不合法时会再滑一次（最多 max_swipes 次）。
-
-    Args:
-        prev_video_id: 上一集的 video_id
-        downloaded_vids: 已成功下载的 video_id 集合，用于避免滑回已下集
-        timeout: 每次上滑后的等待时间
-        max_swipes: 最多滑几次（含首次）
-
-    Returns: True 表示检测到合法的新剧集
+    Returns: 新集的 VideoRef；切集失败返回 None
     """
     downloaded_vids = downloaded_vids or set()
 
@@ -491,17 +566,17 @@ def advance_to_next_episode(state: HookState, prev_video_id: str = "",
         with state.lock:
             old_ref_count = len(state.refs)
 
-        run_adb(["shell", "input", "swipe", "540", "1600", "540", "300", "250"])
+        # 慢速上滑（800ms）避免惯性跨多集；滑动幅度 1400→600 覆盖半屏
+        run_adb(["shell", "input", "swipe", "540", "1400", "540", "600", "800"])
 
         deadline = time.time() + timeout
         while time.time() < deadline:
             legit = _find_legit_ref(old_ref_count)
             if legit:
                 logger.info(f"[切集] 成功 (vid={legit.video_id[:16]}..., dur={legit.duration}s)")
-                return True
+                return legit
             time.sleep(0.3)
 
-        # 分析本次滑动产生了什么，决定是否继续
         with state.lock:
             new_refs = state.refs[old_ref_count:]
         if not new_refs:
@@ -518,7 +593,196 @@ def advance_to_next_episode(state: HookState, prev_video_id: str = "",
             logger.warning(f"[切集] 第{swipe_idx + 1}次上滑拿到 {len(new_refs)} 个新 ref，均不合法: {reasons}")
 
     logger.error(f"[切集] {max_swipes} 次上滑后仍未拿到合法剧集")
+    return None
+
+
+def navigate_to_drama_via_search(drama_name: str, timeout: float = 25.0) -> bool:
+    """通过搜索流程把 App 导航回目标剧的播放页。
+
+    适用场景：上一集下载完后 App 自动连播切到了推荐流，需要重新回到本剧。
+    流程：home → deeplink 搜索 → 输入剧名 → 点击搜索 → 点击结果卡片剧名
+    """
+    env = {**os.environ, "MSYS_NO_PATHCONV": "1"}
+    logger.info(f"[导航] 重新进入《{drama_name}》...")
+    subprocess.run(["adb", "shell", "input", "keyevent", "KEYCODE_HOME"],
+                   capture_output=True, check=False, env=env)
+    time.sleep(2)
+    subprocess.run(
+        ["adb", "shell", "am", "start", "-a", "android.intent.action.VIEW",
+         "-d", "dragon8662://search", APP_PACKAGE],
+        capture_output=True, check=False, env=env,
+    )
+    time.sleep(5)
+    # 聚焦搜索框 + 输入
+    run_adb(["shell", "input", "tap", "500", "150"])
+    time.sleep(1)
+    import base64 as _b64
+    b64 = _b64.b64encode(drama_name.encode("utf-8")).decode("ascii")
+    subprocess.run(["adb", "shell", "am", "broadcast", "-a", "ADB_INPUT_B64",
+                    "--es", "msg", b64],
+                   capture_output=True, check=False, env=env)
+    time.sleep(2)
+    # 点搜索按钮
+    run_adb(["shell", "input", "tap", "984", "150"])
+    time.sleep(5)
+    # 动态定位剧名：dump 搜索结果 XML，找到 text == drama_name 且 y > 250（排除搜索输入框）的节点
+    import xml.etree.ElementTree as _ET
+    import re as _re
+    target_bounds = None
+    for _dump_try in range(3):
+        xml_text = read_ui_xml_from_device()
+        if xml_text:
+            try:
+                root = _ET.fromstring(xml_text)
+                candidates = []
+                for node in root.iter('node'):
+                    if node.get('text', '') != drama_name:
+                        continue
+                    m = _re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', node.get('bounds', ''))
+                    if not m:
+                        continue
+                    x1, y1, x2, y2 = map(int, m.groups())
+                    if y1 < 250:  # 搜索输入框
+                        continue
+                    candidates.append((x1, y1, x2, y2))
+                if candidates:
+                    # 取 y 最小（最靠上的卡片）
+                    candidates.sort(key=lambda b: b[1])
+                    target_bounds = candidates[0]
+                    break
+            except _ET.ParseError:
+                pass
+        time.sleep(1.5)
+    if target_bounds is None:
+        logger.warning(f"[导航] 搜索结果未找到《{drama_name}》卡片，使用固定坐标 fallback")
+        run_adb(["shell", "input", "tap", "282", "500"])
+    else:
+        x_c = (target_bounds[0] + target_bounds[2]) // 2
+        y_c = (target_bounds[1] + target_bounds[3]) // 2
+        logger.info(f"[导航] 找到《{drama_name}》卡片 bounds={target_bounds}，tap ({x_c}, {y_c})")
+        run_adb(["shell", "input", "tap", str(x_c), str(y_c)])
+    time.sleep(8)
+    logger.info("[导航] 搜索流程完成")
+    return True
+
+
+def select_episode_fast(ep_num: int) -> bool:
+    """快速选集：打开选集面板 → 切段 → 点击 ep。不校验高亮（避免 is_target_episode_selected_in_detail 假阴性循环）。"""
+    # 1. 尝试打开选集面板（最多 3 次）
+    picker_open = False
+    _initial_xml = read_ui_xml_from_device()
+    if _initial_xml and 'com.phoenix.read:id/ivi' in _initial_xml:
+        picker_open = True
+
+    if not picker_open:
+        for _ in range(3):
+            run_adb(["shell", "input", "tap", "540", "960"])
+            time.sleep(1.0)
+            _xml = read_ui_xml_from_device()
+            joj = None
+            if _xml:
+                joj = find_element_by_resource_id(_xml, "com.phoenix.read:id/joj")
+                if not joj:
+                    joj = find_text_bounds(_xml, "选集")
+            if joj:
+                tap_bounds(joj)
+            else:
+                # fallback 已知位置
+                run_adb(["shell", "input", "tap", "540", "960"])
+                time.sleep(0.5)
+                run_adb(["shell", "input", "tap", "138", "1836"])
+            time.sleep(1.5)
+            _peek = read_ui_xml_from_device()
+            if _peek and 'com.phoenix.read:id/ivi' in _peek:
+                picker_open = True
+                break
+
+    if not picker_open:
+        logger.warning(f"[快速选集] 选集面板未打开（ep{ep_num}）")
+        return False
+
+    # 2. 切段到 ep 所在范围
+    xml_text = read_ui_xml_from_device()
+    if not xml_text:
+        return False
+    _select_episode_range(xml_text, ep_num)
+    time.sleep(1.0)
+    xml_text = read_ui_xml_from_device()
+    if not xml_text:
+        return False
+
+    # 3. 找到 ep 按钮 tap（最多滚动 6 次）
+    for attempt in range(6):
+        bounds = _find_episode_button(xml_text, ep_num)
+        if bounds:
+            tap_bounds(bounds)
+            logger.info(f"[快速选集] 已点击第{ep_num}集 ivi 按钮")
+            time.sleep(2.0)
+            return True
+        # 滚动面板
+        import re as _re
+        _ys = []
+        try:
+            import xml.etree.ElementTree as _ET
+            for _e in _ET.fromstring(xml_text).iter():
+                if 'ivi' not in _e.attrib.get('resource-id', ''):
+                    continue
+                bm = _re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', _e.attrib.get('bounds', ''))
+                if bm:
+                    _ys.append((int(bm.group(2)), int(bm.group(4))))
+        except Exception:
+            pass
+        if _ys:
+            y_top, y_bot = _ys[0][0], _ys[-1][1]
+            y_ctr = (y_top + y_bot) // 2
+            dy = max(60, min(100, (y_bot - y_top) // 4))
+            y_a, y_b = max(y_ctr - dy, y_top + 5), min(y_ctr + dy, y_bot - 5)
+            # 小 ep 向上滚（手指向下），大 ep 向下滚
+            if ep_num <= 15:
+                run_adb(["shell", "input", "swipe", "540", str(y_a), "540", str(y_b), "500"])
+            else:
+                run_adb(["shell", "input", "swipe", "540", str(y_b), "540", str(y_a), "500"])
+            time.sleep(0.8)
+        new_xml = read_ui_xml_from_device()
+        if not new_xml or 'com.phoenix.read:id/ivi' not in new_xml:
+            logger.warning(f"[快速选集] 面板已关闭（滚动穿透）")
+            return False
+        xml_text = new_xml
+
+    logger.warning(f"[快速选集] {6} 次滚动后仍未找到 ep{ep_num} 按钮")
     return False
+
+
+def select_episode_and_wait(ep_num: int, state: HookState,
+                             downloaded_vids: set[str],
+                             timeout: float = 15.0) -> VideoRef | None:
+    """通过选集面板精确跳到第 ep_num 集，等待 Hook 触发合法新 VideoRef。
+
+    用选集面板（ivi 按钮）代替上滑切集，避免从最后一集/任意集滑出本剧进入推荐流。
+    """
+    with state.lock:
+        old_ref_count = len(state.refs)
+
+    # 用 select_episode_fast（不做"高亮校验"，避免假阴性循环）
+    if not select_episode_fast(ep_num):
+        logger.warning(f"[选集] 第{ep_num}集 UI 选集失败")
+        return None
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with state.lock:
+            candidates = state.refs[old_ref_count:]
+        for ref in candidates:
+            if ref.video_id in downloaded_vids:
+                continue
+            if not (EPISODE_DURATION_MIN <= ref.duration <= EPISODE_DURATION_MAX):
+                continue
+            logger.info(f"[选集] 第{ep_num}集 Hook 到新 ref (vid={ref.video_id[:16]}..., dur={ref.duration}s)")
+            return ref
+        time.sleep(0.3)
+
+    logger.warning(f"[选集] 第{ep_num}集选集后 {timeout}s 内未收到合法新 ref")
+    return None
 
 
 def download_current_episode(
@@ -611,6 +875,12 @@ def main():
     parser.add_argument("-n", "--name", required=True, help="短剧名称")
     parser.add_argument("-e", "--start-episode", type=int, default=1, help="起始集数")
     parser.add_argument("--output", default="./videos", help="输出根目录")
+    parser.add_argument("--attach-running", action="store_true",
+                        help="attach 到已运行 App（跳过自动导航）。使用前请手动把 App 调到目标剧的全屏播放页")
+    parser.add_argument("--total-episodes", type=int, default=None,
+                        help="总集数。attach 模式下必须显式指定")
+    parser.add_argument("--bootstrap-navigate", action="store_true",
+                        help="attach 后先通过搜索导航到目标剧（首次启动或 App 不在本剧时用）")
     args = parser.parse_args()
 
     drama_name = args.name
@@ -631,75 +901,100 @@ def main():
 
     # 1. 初始化 Frida
     state = HookState()
-    session, script, pid = setup_frida(APP_PACKAGE, state)
+    session, script, pid = setup_frida(APP_PACKAGE, state, attach_running=args.attach_running)
 
-    # 2. 导航到离线缓存
-    logger.info("[1/4] 导航到离线缓存...")
-    cache_ok = navigate_to_offline_cache()
-
-    # 3. 进入剧
-    player_ok = False
-    if cache_ok:
-        logger.info("[2/4] 进入播放器...")
-        player_ok = enter_drama_from_cache(drama_name)
-
-    if not player_ok:
-        logger.warning("[2/4] 离线缓存入口失败，尝试搜索入口...")
-        try:
-            from scripts.download_drama import search_drama_in_app, set_adapter
-            from scripts.app_adapter import create_adapter
-            set_adapter(create_adapter("honguo"))
-            # 搜索入口：导航到目标剧播放器
-            # 注意：search_drama_in_app 内部的 UI 集数验证在播放器中会失败（uiautomator 限制），
-            # 但它会成功进入播放器并触发 Hook 数据。返回值 False 不代表失败。
-            search_drama_in_app(drama_name, start_episode=start_ep)
-            # 不依赖返回值，后面通过 Hook 数据确认
-        except Exception as e:
-            logger.error(f"搜索入口也失败: {e}")
-
-    # 即使 search_drama_in_app 返回 False，通过多种方式确认播放器状态
-    if not player_ok:
-        logger.info("[2/4] 检查当前状态...")
-        # 方式 1：检查 Hook 是否已收到数据（说明播放器已在播放）
-        ref, url, key = state.get_after_fence(0)
-        if ref and url and key:
-            logger.info(f"[2/4] Hook 已捕获数据 (vid={ref.video_id[:16]}...)，确认播放器活跃")
-            player_ok = True
+    # attach 模式：可选先 bootstrap-navigate 到目标剧
+    if args.attach_running:
+        if args.total_episodes is None:
+            logger.error("attach 模式必须通过 --total-episodes 指定总集数")
+            return
+        if args.bootstrap_navigate:
+            logger.info("[attach] bootstrap-navigate: 先通过搜索导航到目标剧")
+            navigate_to_drama_via_search(drama_name)
         else:
-            # 方式 2：检查 UI
-            xml = _wait_and_dump(delay=2.0)
-            if xml:
-                ctx = parse_ui_context(xml)
-                if ctx.episode is not None:
-                    logger.info(f"[2/4] UI 确认在播放器中，当前第 {ctx.episode} 集")
-                    player_ok = True
-                elif find_text_contains_bounds(xml, drama_name):
-                    # 在详情页，点击封面进入播放器
-                    logger.info("[2/4] 在详情页，点击封面进入播放器...")
-                    run_adb(["shell", "input", "tap", "195", "400"])
-                    time.sleep(5)
-                    # 再检查 Hook
-                    ref2, url2, key2 = state.get_after_fence(0)
-                    if ref2 and key2:
-                        logger.info("[2/4] 点击封面后 Hook 收到数据，确认进入播放器")
+            logger.info("[attach] 跳过自动导航，假设 App 已在全屏播放页")
+        # 等待 Hook 产生第一条 video_ref（播放页应当已在播放）
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            ref, url, key = state.get_latest()
+            if ref and url and key:
+                logger.info(f"[attach] 检测到 Hook 数据 (vid={ref.video_id[:16]}..., dur={ref.duration}s)")
+                break
+            time.sleep(1)
+        else:
+            logger.warning("[attach] 30 秒内未收到 Hook 数据。请确保 App 正在播放视频；若视频暂停请播放一次")
+        xml_for_total = None  # attach 模式不从 UI 读总集数
+    else:
+        # Spawn 模式：自动导航到离线缓存或搜索入口
+        logger.info("[1/4] 导航到离线缓存...")
+        cache_ok = navigate_to_offline_cache()
+
+        player_ok = False
+        if cache_ok:
+            logger.info("[2/4] 进入播放器...")
+            player_ok = enter_drama_from_cache(drama_name)
+
+        if not player_ok:
+            logger.warning("[2/4] 离线缓存入口失败，尝试搜索入口...")
+            try:
+                from scripts.download_drama import search_drama_in_app, set_adapter
+                from scripts.app_adapter import create_adapter
+                set_adapter(create_adapter("honguo"))
+                search_drama_in_app(drama_name, start_episode=start_ep)
+            except Exception as e:
+                logger.error(f"搜索入口也失败: {e}")
+
+        if not player_ok:
+            logger.info("[2/4] 检查当前状态...")
+            ref, url, key = state.get_after_fence(0)
+            if ref and url and key:
+                logger.info(f"[2/4] Hook 已捕获数据 (vid={ref.video_id[:16]}...)，确认播放器活跃")
+                player_ok = True
+            else:
+                xml = _wait_and_dump(delay=2.0)
+                if xml:
+                    ctx = parse_ui_context(xml)
+                    if ctx.episode is not None:
+                        logger.info(f"[2/4] UI 确认在播放器中，当前第 {ctx.episode} 集")
                         player_ok = True
+                    elif find_text_contains_bounds(xml, drama_name):
+                        logger.info("[2/4] 在详情页，点击封面进入播放器...")
+                        run_adb(["shell", "input", "tap", "195", "400"])
+                        time.sleep(5)
+                        ref2, url2, key2 = state.get_after_fence(0)
+                        if ref2 and key2:
+                            logger.info("[2/4] 点击封面后 Hook 收到数据，确认进入播放器")
+                            player_ok = True
 
-    if not player_ok:
-        logger.error("无法进入播放器，退出")
-        return
+        if not player_ok:
+            logger.error("无法进入播放器，退出")
+            return
 
-    # 4. 获取总集数：先从详情页解析"全XX集"，再从播放器 UI 获取
-    total_eps = read_ui_total_episodes()
-    if total_eps is None:
-        # 尝试从之前 dump 的 XML 解析"全XX集"
-        if xml:
-            import re as _re
-            m = _re.search(r'全(\d+)集', xml)
+        # 确保在全屏播放页
+        import re as _re
+        xml_for_total: str | None = None
+        xml_probe = _wait_and_dump(delay=1.0, retries=1)
+        if xml_probe:
+            m_total = _re.search(r'全(\d+)集', xml_probe)
+            if m_total:
+                xml_for_total = xml_probe
+        ensure_fullscreen_player()
+
+    # 4. 获取总集数：attach 模式用 CLI 参数；否则优先用 xml_for_total，再 fallback 到 UI dump
+    import re as _re2
+    if args.attach_running:
+        total_eps = args.total_episodes
+    else:
+        total_eps = None
+        if xml_for_total:
+            m = _re2.search(r'全(\d+)集', xml_for_total)
             if m:
                 total_eps = int(m.group(1))
-    if total_eps is None:
-        logger.warning("无法从 UI 获取总集数，使用默认值 60")
-        total_eps = 60
+        if total_eps is None:
+            total_eps = read_ui_total_episodes()
+        if total_eps is None:
+            logger.warning("无法从 UI 获取总集数，使用默认值 60")
+            total_eps = 60
     logger.info(f"[3/4] 总集数: {total_eps}")
 
     # 5. 生成下载计划
@@ -719,11 +1014,10 @@ def main():
     manifest_path = os.path.join(output_dir, "session_manifest.jsonl")
     success_count = 0
     failed_eps = []
-    need_advance = False  # 首集无需切集，后续每集都需要
     last_video_id = ""     # 上一集的 video_id，用于 advance 去重
     downloaded_vids: set[str] = set()  # 所有已下载的 video_id，防止隔集重复
 
-    # 加载已有 manifest 的成功记录，避免跨 session 重复 append
+    # 加载已有 manifest 的成功记录，避免跨 session 重复 append；同时填充 downloaded_vids
     recorded_ok: set[tuple[int, str]] = set()
     if os.path.exists(manifest_path):
         with open(manifest_path, encoding="utf-8") as _f:
@@ -731,80 +1025,97 @@ def main():
                 try:
                     _rec = json.loads(_line)
                     if _rec.get("status") == "ok":
-                        recorded_ok.add((int(_rec["episode"]), str(_rec.get("video_id", ""))))
+                        vid = str(_rec.get("video_id", ""))
+                        recorded_ok.add((int(_rec["episode"]), vid))
+                        if vid:
+                            downloaded_vids.add(vid)
                 except (json.JSONDecodeError, KeyError, ValueError):
                     continue
+
+    # 首集默认不 advance（假设播放器已对齐 plan[0]）；done 集在循环中会自然推动 advance
+    need_advance = False
+    current_ref, _, _ = state.get_latest()
+    if current_ref:
+        last_video_id = current_ref.video_id
+    logger.info(f"[启动] downloaded_vids={len(downloaded_vids)} 条, need_advance={need_advance}")
+
+    # 保险：连续失败次数上限，防止跨出本剧后继续空跑
+    consecutive_failures = 0
+    MAX_CONSECUTIVE_FAILURES = 3
 
     for task in tqdm(plan, desc="下载进度"):
         ep_num = task["ep"]
 
-        # 切集（跳过首集）
-        if need_advance:
-            try:
-                if not advance_to_next_episode(state, prev_video_id=last_video_id,
-                                               downloaded_vids=downloaded_vids):
-                    logger.warning(f"[第{ep_num}集] 切集失败")
-                    if task["status"] != "done":
-                        failed_eps.append(ep_num)
-                    continue
-            except frida.InvalidOperationError:
-                logger.warning(f"[第{ep_num}集] Frida 断开，恢复...")
-                session, script, pid = recover_frida(state, drama_name)
-                if task["status"] != "done":
-                    failed_eps.append(ep_num)
-                continue
-        need_advance = True
-
-        # 已完成的集只需切集跳过，更新 last_video_id
+        # done 集：无需切集也无需下载
         if task["status"] == "done":
-            ref, _, _ = state.get_latest()
-            if ref:
-                last_video_id = ref.video_id
             logger.debug(f"[第{ep_num}集] 已完成，跳过")
             continue
 
-        # 下载当前播放的集
-        ref, url, key = state.get_latest()
-        result = None
+        # 通过选集面板精确跳到第 ep_num 集，失败则重新导航后重试一次
+        try:
+            target_ref = select_episode_and_wait(ep_num, state, downloaded_vids)
+        except frida.InvalidOperationError:
+            logger.warning(f"[第{ep_num}集] Frida 断开，恢复...")
+            session, script, pid = recover_frida(state, drama_name)
+            failed_eps.append(ep_num)
+            consecutive_failures += 1
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                logger.error(f"[保险] 连续 {consecutive_failures} 次选集失败，提前终止")
+                break
+            continue
 
-        if ref and url and key:
-            # 去重检查：video_id 不能和任何已下载集重复
-            if ref.video_id in downloaded_vids:
-                logger.warning(f"[第{ep_num}集] video_id 重复 ({ref.video_id[:16]}...)，跳过")
-                failed_eps.append(ep_num)
-                continue
-
-            vid8 = ref.video_id[-8:] if len(ref.video_id) >= 8 else ref.video_id
-            output_path = os.path.join(output_dir, f"episode_{ep_num:03d}_{vid8}.mp4")
-            expected_dur = ref.duration if ref.duration > 0 else 0
-            if download_and_decrypt(url, key.key_hex, output_path) \
-                    and verify_playable(output_path, expected_duration=expected_dur):
-                result = {"success": True, "ep": ep_num, "video_id": ref.video_id, "path": output_path}
-                last_video_id = ref.video_id
-                downloaded_vids.add(ref.video_id)
-            else:
-                if os.path.exists(output_path):
-                    os.remove(output_path)
-
-        if result is None:
-            # get_latest 失败，fallback 到围栏捕获
+        if target_ref is None:
+            # App 可能自动连播切出本剧。重新导航回本剧播放页后再试一次
+            logger.info(f"[第{ep_num}集] 选集失败，重新导航回本剧...")
             try:
-                result = download_current_episode(ep_num, state, output_dir, time.time() - 30)
-                if result and result.get("success"):
-                    last_video_id = result.get("video_id", "")
-                    downloaded_vids.add(last_video_id)
+                navigate_to_drama_via_search(drama_name)
+                target_ref = select_episode_and_wait(ep_num, state, downloaded_vids)
             except frida.InvalidOperationError:
+                logger.warning(f"[第{ep_num}集] Frida 断开，恢复...")
                 session, script, pid = recover_frida(state, drama_name)
-                result = download_current_episode(ep_num, state, output_dir, time.time())
-                if result and result.get("success"):
-                    last_video_id = result.get("video_id", "")
-                    downloaded_vids.add(last_video_id)
 
-        if result is None:
+        if target_ref is None:
+            logger.warning(f"[第{ep_num}集] 选集失败或未拿到合法 ref")
+            failed_eps.append(ep_num)
+            consecutive_failures += 1
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                logger.error(f"[保险] 连续 {consecutive_failures} 次选集失败，提前终止")
+                break
+            continue
+
+        if target_ref.video_id in downloaded_vids:
+            logger.warning(f"[第{ep_num}集] 目标 vid={target_ref.video_id[:16]}... 已下载过，跳过")
+            failed_eps.append(ep_num)
+            continue
+
+        ref, url, key = state.get_complete_by_vid(target_ref.video_id, timeout=12.0)
+        if not (ref and url and key):
+            logger.warning(f"[第{ep_num}集] 按 vid 配对失败: ref={'有' if ref else '无'} url={'有' if url else '无'} key={'有' if key else '无'}")
+            failed_eps.append(ep_num)
+            consecutive_failures += 1
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                logger.error(f"[保险] 连续 {consecutive_failures} 次配对失败，疑似跨出本剧或 Hook 失效，提前终止")
+                break
+            continue
+
+        vid8 = ref.video_id[-8:] if len(ref.video_id) >= 8 else ref.video_id
+        output_path = os.path.join(output_dir, f"episode_{ep_num:03d}_{vid8}.mp4")
+        expected_dur = ref.duration if ref.duration > 0 else 0
+
+        result = None
+        if download_and_decrypt(url, key.key_hex, output_path) \
+                and verify_playable(output_path, expected_duration=expected_dur):
+            result = {"success": True, "ep": ep_num, "video_id": ref.video_id, "path": output_path}
+            last_video_id = ref.video_id
+            downloaded_vids.add(ref.video_id)
+        else:
+            if os.path.exists(output_path):
+                os.remove(output_path)
             result = {"success": False, "ep": ep_num, "video_id": "", "path": ""}
 
         if result["success"]:
             success_count += 1
+            consecutive_failures = 0  # 成功时重置连续失败计数
             key_tuple = (result["ep"], result["video_id"])
             if key_tuple not in recorded_ok:
                 append_jsonl(manifest_path, {
