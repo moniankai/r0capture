@@ -138,7 +138,7 @@ Java.perform(function() {
             };
         });
     } catch(e){}
-    send({t:'ready', msg:'v4 hooks ready, F@' + F_addr});
+    send({t:'ready', msg:'v4 hooks ready'});
 });
 """
 
@@ -314,19 +314,16 @@ def scan_panel(total_eps: int) -> tuple[dict[int, tuple[int,int]], dict[str, tup
     logger.info(f"[扫描] 段按钮: {seg_btn}")
 
     cells: dict[int, tuple[int, int]] = {}
-    for (label, lo, hi) in segments:
-        if label in seg_btn:
-            run_adb(["shell", "input", "tap", str(seg_btn[label][0]), str(seg_btn[label][1])])
-            time.sleep(1.0)
+
+    def _scan_current_panel(lo, hi):
         xml = read_ui_xml_from_device()
         if not xml:
-            logger.warning(f"[扫描] {label} dump 失败")
-            continue
+            return 0
         try:
             root = ET.fromstring(xml)
         except ET.ParseError:
-            continue
-        seg_hits = 0
+            return 0
+        hits = 0
         for n in root.iter('node'):
             txt = (n.get('text') or '').strip()
             if not txt.isdigit():
@@ -336,8 +333,31 @@ def scan_panel(total_eps: int) -> tuple[dict[int, tuple[int,int]], dict[str, tup
                 b = _parse_bounds(n.get('bounds', ''))
                 if b and ep not in cells:
                     cells[ep] = ((b[0]+b[2])//2, (b[1]+b[3])//2)
-                    seg_hits += 1
-        logger.info(f"[扫描] 段 {label}: 拿到 {seg_hits} 个格子")
+                    hits += 1
+        return hits
+
+    for (label, lo, hi) in segments:
+        expected = hi - lo + 1
+        if label in seg_btn:
+            run_adb(["shell", "input", "tap", str(seg_btn[label][0]), str(seg_btn[label][1])])
+            time.sleep(1.0)
+        # 先 swipe down 几次把面板回滚到段顶（RecyclerView 可能从上段位置继承）
+        for _ in range(4):
+            run_adb(["shell", "input", "swipe", "540", "1400", "540", "1800", "300"])
+            time.sleep(0.3)
+        seg_hits = _scan_current_panel(lo, hi)
+        # 如果段内没拿全，swipe 面板内容向上滚动露出后续格子，最多滚 3 次
+        scroll_n = 0
+        while seg_hits < expected and scroll_n < 3:
+            # 面板内容区大致 y=1300..1920；向上滑 ~500px 把后续集号滚上来
+            run_adb(["shell", "input", "swipe", "540", "1700", "540", "1200", "400"])
+            time.sleep(0.8)
+            more = _scan_current_panel(lo, hi)
+            if more == 0:
+                break  # 滚到底没新增
+            seg_hits += more
+            scroll_n += 1
+        logger.info(f"[扫描] 段 {label}: 拿到 {seg_hits}/{expected} 格子（滚动 {scroll_n} 次）")
 
     # 关面板
     run_adb(["shell", "input", "keyevent", "KEYCODE_BACK"])
@@ -382,6 +402,40 @@ def collect_episode(state: State, ep: int, total: int, cells: dict,
     run_adb(["shell", "input", "tap", str(x), str(y)])
 
     # 等 setVideoModel fire
+    cap = state.wait_new(timeout=4.0)
+    if cap is not None and cap.kid:
+        return cap
+
+    # 失败重试：App 可能已在该集，tap 无效触发 → 先 tap 邻集切换状态，再回来
+    neighbor = None
+    for cand in (ep + 1, ep - 1, ep + 2):
+        if cand in cells and 1 <= cand:
+            neighbor = cand
+            break
+    if neighbor is None:
+        return None
+    logger.info(f"[重试] 第{ep}集 cap=None，tap 邻集 ep{neighbor} 切换状态再回来")
+    # tap 邻集（此时面板应已关，tap 选集重开）
+    run_adb(["shell", "input", "tap", "540", "1820"])
+    time.sleep(1.2)
+    # 段切换（邻集可能不同段）
+    neighbor_seg = ep_to_segment(neighbor, total)
+    if cur_seg[0] != neighbor_seg and neighbor_seg in seg_btn:
+        run_adb(["shell", "input", "tap", str(seg_btn[neighbor_seg][0]), str(seg_btn[neighbor_seg][1])])
+        time.sleep(0.8)
+        cur_seg[0] = neighbor_seg
+    run_adb(["shell", "input", "tap", str(cells[neighbor][0]), str(cells[neighbor][1])])
+    time.sleep(1.5)
+    with state.lock:
+        state.last_new = None
+    # 再 tap 目标集
+    run_adb(["shell", "input", "tap", "540", "1820"])
+    time.sleep(1.2)
+    if cur_seg[0] != target_seg and target_seg in seg_btn:
+        run_adb(["shell", "input", "tap", str(seg_btn[target_seg][0]), str(seg_btn[target_seg][1])])
+        time.sleep(0.8)
+        cur_seg[0] = target_seg
+    run_adb(["shell", "input", "tap", str(x), str(y)])
     cap = state.wait_new(timeout=4.0)
     return cap
 
