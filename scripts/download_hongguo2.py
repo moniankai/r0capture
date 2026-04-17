@@ -35,9 +35,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from scripts.decrypt_video import decrypt_mp4, fix_metadata
 from scripts.drama_download_common import run_adb, append_jsonl
 from scripts.download_drama import select_running_app_pid
-from scripts.download_hongguo import navigate_to_drama_via_search, verify_playable
+from scripts.download_hongguo import verify_playable
+from scripts.drama_download_common import read_ui_xml_from_device
 
 APP_PACKAGE = "com.phoenix.read"
+PLAYER_ACTIVITY = "ShortSeriesActivity"
 
 HOOK_JS = r"""
 Java.perform(function() {
@@ -153,12 +155,15 @@ class Capture:
 class State:
     """捕获状态：有序 kid 列表 + kid→Capture 映射。"""
 
-    def __init__(self):
+    def __init__(self, cluster: str | None = None):
         self.lock = threading.Lock()
         self.order: list[str] = []          # 按首次见到时间排序的 kid 列表
         self.by_kid: dict[str, Capture] = {}
         self.unpaired_keys: list[tuple[str, float]] = []  # (hex_key, ts) 尚未匹配到 kid 的预加载 key
         self.chunks: dict[int, dict[int, str]] = {}
+        # 剧集群 ID：kid[8:12]。外部显式传入最可靠；None 表示延后自动锁定
+        self.cluster: str | None = cluster
+        self.rejected_count = 0  # 被集群过滤丢弃的 kid 计数（诊断用）
 
     def ingest_ref(self, text: str):
         try:
@@ -180,6 +185,16 @@ class State:
                 kids_in_ref.setdefault(kid, []).append(v)
 
             for kid, entries in kids_in_ref.items():
+                # 集群过滤：首个 kid 锁定剧集群（kid[8:12]），之后仅同集群 kid 才入 order
+                cluster_id = kid[8:12]
+                if self.cluster is None:
+                    self.cluster = cluster_id
+                    logger.info(f"[集群] 锁定剧集群 ID = {cluster_id} (首 kid={kid[:16]}...)")
+                elif cluster_id != self.cluster:
+                    self.rejected_count += 1
+                    if self.rejected_count <= 5 or self.rejected_count % 20 == 0:
+                        logger.warning(f"[集群] 丢弃异集群 kid={kid[:16]}... (id={cluster_id} vs 本剧 {self.cluster}), 累计丢 {self.rejected_count}")
+                    continue
                 if kid in self.by_kid:
                     cap = self.by_kid[kid]
                     known_urls = {s.main_url for s in cap.streams}
@@ -349,6 +364,140 @@ def setup_frida(attach_running: bool, state: State):
     return session, script, pid
 
 
+def _current_activity() -> str:
+    env = {**os.environ, "MSYS_NO_PATHCONV": "1"}
+    try:
+        out = subprocess.check_output(["adb", "shell", "dumpsys", "activity", "top"],
+                                      env=env, timeout=8)
+        for line in out.splitlines():
+            if b"ACTIVITY com.phoenix" in line:
+                return line.decode("utf-8", errors="ignore")
+    except Exception:
+        pass
+    return ""
+
+
+def _parse_bounds(s: str) -> tuple[int, int, int, int] | None:
+    import re
+    m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", s or "")
+    if not m:
+        return None
+    return tuple(int(x) for x in m.groups())  # type: ignore[return-value]
+
+
+def navigate_to_drama_v2(drama_name: str, timeout: float = 25.0) -> bool:
+    """搜索导航 v2：deeplink → 优选搜索历史直通 → 兜底输入+搜索 → 点海报进播放。
+
+    改进点（对比 v1）：
+    - 搜索历史 GridView 里若有目标剧直接 tap（避免 ADBKeyboard 追加污染）
+    - 结果页 tap 整张剧卡片**海报中心**（非标题），实测直达 ShortSeriesActivity
+    - 导航完轮询 dumpsys activity top 直到播放器就绪，否则返回 False
+    """
+    import xml.etree.ElementTree as ET
+    env = {**os.environ, "MSYS_NO_PATHCONV": "1"}
+
+    def _dump_root():
+        xml = read_ui_xml_from_device()
+        if not xml:
+            return None
+        try:
+            return ET.fromstring(xml)
+        except ET.ParseError:
+            return None
+
+    logger.info(f"[导航v2] 打开搜索 deep link 进入《{drama_name}》")
+    subprocess.run(["adb", "shell", "input", "keyevent", "KEYCODE_HOME"],
+                   capture_output=True, check=False, env=env)
+    time.sleep(1.5)
+    subprocess.run(
+        ["adb", "shell", "am", "start", "-a", "android.intent.action.VIEW",
+         "-d", "dragon8662://search", APP_PACKAGE],
+        capture_output=True, check=False, env=env,
+    )
+    time.sleep(4.0)
+
+    # 阶段 1：尝试搜索历史直通
+    history_tap = None
+    root = _dump_root()
+    if root is not None:
+        for n in root.iter("node"):
+            if n.get("resource-id", "").endswith("id/drv") and n.get("text", "") == drama_name:
+                b = _parse_bounds(n.get("bounds", ""))
+                if b:
+                    history_tap = ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
+                    break
+    if history_tap:
+        logger.info(f"[导航v2] 搜索历史命中，tap {history_tap}")
+        run_adb(["shell", "input", "tap", str(history_tap[0]), str(history_tap[1])])
+        time.sleep(5.0)
+    else:
+        # 阶段 2：清空输入框 + 输入 + 点搜索
+        logger.info("[导航v2] 搜索历史未命中，走输入+搜索流程")
+        run_adb(["shell", "input", "tap", "500", "150"])  # 聚焦输入框
+        time.sleep(0.8)
+        subprocess.run(["adb", "shell", "am", "broadcast", "-a", "ADB_CLEAR_TEXT"],
+                       capture_output=True, check=False, env=env)
+        time.sleep(0.5)
+        import base64 as _b64
+        b64 = _b64.b64encode(drama_name.encode("utf-8")).decode("ascii")
+        subprocess.run(["adb", "shell", "am", "broadcast", "-a", "ADB_INPUT_B64",
+                        "--es", "msg", b64],
+                       capture_output=True, check=False, env=env)
+        time.sleep(1.5)
+        run_adb(["shell", "input", "tap", "984", "150"])  # 点搜索按钮
+        time.sleep(5.0)
+
+    # 阶段 3：结果页点剧卡片海报（避开标题）
+    poster_tap = None
+    for _try in range(3):
+        root = _dump_root()
+        if root is None:
+            time.sleep(1.5)
+            continue
+        # 策略：找 text == drama_name 的 id/jy3 标题节点，取其上方（y 更小）
+        # 同列容器中的 id/h65 海报节点。容错匹配：同一 id/d1 卡片下的 id/h65。
+        title_b = None
+        for n in root.iter("node"):
+            if n.get("text", "") == drama_name and n.get("resource-id", "").endswith("id/jy3"):
+                title_b = _parse_bounds(n.get("bounds", ""))
+                if title_b:
+                    break
+        if title_b is None:
+            # 退回：text 匹配 + y > 250（排除输入框）
+            cands = []
+            for n in root.iter("node"):
+                if n.get("text", "") == drama_name:
+                    b = _parse_bounds(n.get("bounds", ""))
+                    if b and b[1] > 250:
+                        cands.append(b)
+            title_b = cands[0] if cands else None
+        if title_b:
+            # 海报通常在标题上方 400-700px 区域，x 范围与标题重叠
+            x_c = (title_b[0] + title_b[2]) // 2
+            # 海报 y 取 (title_top - 350) 左右
+            y_c = max(400, title_b[1] - 380)
+            poster_tap = (x_c, y_c)
+            logger.info(f"[导航v2] 命中剧卡片标题 bounds={title_b}，点海报中心 ({x_c},{y_c})")
+            break
+        time.sleep(1.5)
+
+    if poster_tap is None:
+        logger.error(f"[导航v2] 搜索结果中未找到《{drama_name}》卡片")
+        return False
+
+    run_adb(["shell", "input", "tap", str(poster_tap[0]), str(poster_tap[1])])
+
+    # 阶段 4：等播放器就绪
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if PLAYER_ACTIVITY in _current_activity():
+            logger.info(f"[导航v2] 播放器 {PLAYER_ACTIVITY} 已就绪")
+            return True
+        time.sleep(0.7)
+    logger.error(f"[导航v2] {timeout}s 内未进入 {PLAYER_ACTIVITY}，当前 {_current_activity()}")
+    return False
+
+
 def download_and_decrypt(stream: Stream, key_hex: str, output_path: str) -> bool:
     tmp = output_path + ".tmp"
     urls = [stream.main_url] + ([stream.backup_url] if stream.backup_url else [])
@@ -485,6 +634,8 @@ def main():
                     help="attach 到已运行 App，跳过搜索导航。需确保 App 已在第 start-episode 集全屏播放")
     ap.add_argument("--max-height", type=int, default=1080,
                     help="画质短边上限（默认 1080）。短边 = min(vheight,vwidth)，兼容横竖屏。符合条件档位中选 bitrate 最高。")
+    ap.add_argument("--cluster", type=str, default=None,
+                    help="剧集群 ID（kid[8:12]，如 f881）。显式指定则只接受该集群 kid；不传则首 kid 自动锁定（首 kid 若是推荐流预加载会锁错，**续跑请务必显式传**）。")
     args = ap.parse_args()
 
     output_dir = os.path.join(args.output, args.name)
@@ -494,14 +645,22 @@ def main():
                format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}", level="INFO")
     logger.info(f"目标: 《{args.name}》 ep{args.start_episode}..{args.total_episodes}")
 
-    state = State()
+    if args.cluster:
+        logger.info(f"[集群] 显式锁定剧集群 = {args.cluster}")
+    state = State(cluster=args.cluster)
     session, script, pid = setup_frida(args.attach_running, state)
 
     # 只有非 attach 模式才自动搜索导航
     if not args.attach_running:
         logger.info("[导航] 搜索并进入目标剧...")
-        navigate_to_drama_via_search(args.name)
-        time.sleep(5)
+        if not navigate_to_drama_v2(args.name):
+            logger.error("[导航] 失败，无法进入播放器。请用 --attach-running 手动操作")
+            try:
+                script.unload(); session.detach()
+            except Exception:
+                pass
+            sys.exit(1)
+        time.sleep(3)
 
     manifest = os.path.join(output_dir, "session_manifest_v2.jsonl")
     success, failed = capture_and_download_loop(
