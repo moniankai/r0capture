@@ -5,16 +5,20 @@
 
 架构:
 - v5 作为 subprocess 运行 (不 import, 故障隔离)
-- FSM 状态机: INIT → RESOLVING → NAVIGATING → DOWNLOADING → VERIFYING → DONE
+- FSM 状态机: INIT → NAVIGATING → DOWNLOADING → VERIFYING → DONE
   (可从 DOWNLOADING/VERIFYING 转 RECOVERING, 回 DOWNLOADING)
-- Watchdog 线程: 分阶段健康判据 + 进度停滞检测
-- 熔断: L1 单集重试 / L2 连续失败硬重启 / L3 硬重启上限 / 时间上限
+  注: RESOLVING enum 保留未用, 当前 --series-id 必需 (先用 v5 legacy 获取).
+- Watchdog inline: read_events stall + cb.stalled + cb.should_trigger_restart
+- 熔断: L1 单集重试 / L2 连续失败硬重启 / L3 硬重启上限 / 时间上限 / 停滞
 - Recovery: 杀 subprocess → 清 stale → 重启 frida → 启 App → tap 进剧 → attach-resume
 - 验证: probe-bind 均匀采样 5 集 + recovery 边界集, vid 对齐
 
 用法:
-  python scripts/hongguo_agent.py -n "剧名" [--series-id X] [--total T]
+  python scripts/hongguo_agent.py -n "剧名" --series-id X [--total T]
                                   [--max-restarts 5] [--max-total-seconds 3600]
+                                  [--splash-timeout 40] [--tap-wait 4.0]
+                                  [--download-stall 60] [--verify-stall 90]
+                                  [--fullscreen-tap "570,1281"]
 """
 from __future__ import annotations
 import argparse
@@ -47,6 +51,33 @@ V5_EXIT_ANR = 2
 V5_EXIT_FATAL = 3
 V5_EXIT_USER_ABORT = 4
 V5_EXIT_PRECOND = 5
+
+
+# =============== Runtime Config (Codex N2: magic numbers → config) ===============
+
+@dataclass
+class RuntimeConfig:
+    """关键运行时参数. 默认值基于 MIUI/Android 9 实测, CLI 可覆盖."""
+    # App 启动 / 导航
+    splash_to_main_timeout: int = 40       # splash → main/ShortSeries 最多等 (秒)
+    post_tap_wait: float = 4.0             # tap 后等 Activity 切换
+    post_force_stop_wait: float = 2.0      # force_stop 后等 App 进程清理
+    nav_max_retries: int = 3               # navigate_to_short_series 主循环重试数
+    force_stop_retries: int = 3            # cleanup_stale_resources 里 force-stop 次数
+
+    # UI dump
+    ui_dump_retries: int = 3               # uiautomator dump 失败重试数
+    ui_dump_idle_wait: float = 2.5         # dump 失败后等 App idle (秒)
+
+    # Frida
+    frida_restart_wait: float = 10.0       # kill frida-server 后等重启 (秒)
+
+    # v5 subprocess stall
+    download_stall_timeout: float = 60.0   # DOWNLOADING 45s+ 无事件视为 hang
+    verify_stall_timeout: float = 90.0     # VERIFYING 无事件超时
+
+    # 坐标 fallback (App 布局变化时可覆盖)
+    fullscreen_watch_tap: tuple[int, int] = (570, 1281)
 
 
 # =============== ep_fail reason 分类 (Codex S2) ===============
@@ -92,6 +123,8 @@ def classify_fail_reason(reason: str) -> str:
 
 class State(str, Enum):
     INIT = 'INIT'
+    # RESOLVING: reserved for future spawn-resolve impl (auto series_id lookup).
+    # 当前 Agent 要求 --series-id 必需, 未进此状态.
     RESOLVING = 'RESOLVING'
     NAVIGATING = 'NAVIGATING'
     DOWNLOADING = 'DOWNLOADING'
@@ -260,10 +293,12 @@ def restart_frida_server() -> bool:
 
 # =============== UI dump fallback 链 (design v4 §4.5) ===============
 
-def uiautomator_dump(local_path: Path, retries: int = 3) -> bool:
+def uiautomator_dump(local_path: Path, retries: int = 3,
+                      cfg: RuntimeConfig | None = None) -> bool:
     """dump + pull ui.xml. 三重 retry + --compressed fallback.
     Android 9 "could not get idle state" 高频, 需要多策略兜底.
     """
+    cfg = cfg or RuntimeConfig()
     for i in range(retries):
         # 1. 标准 dump
         rc, _ = adb_shell("uiautomator dump /sdcard/ui.xml", timeout=6)
@@ -281,7 +316,7 @@ def uiautomator_dump(local_path: Path, retries: int = 3) -> bool:
             if r.returncode == 0 and local_path.exists():
                 return True
 
-        time.sleep(2.5)  # 等 App idle
+        time.sleep(cfg.ui_dump_idle_wait)  # 等 App idle
     return False
 
 
@@ -354,9 +389,11 @@ def safe_kill_subprocess_tree(proc: subprocess.Popen | None,
 
 # =============== stale 清理 (design v4 §4.4) ===============
 
-def cleanup_stale_resources(my_token: str, drama_dir: Path) -> None:
+def cleanup_stale_resources(my_token: str, drama_dir: Path,
+                             cfg: RuntimeConfig | None = None) -> None:
     """Recovery 前清除脏状态. 清不掉 raise.
     stale 检测能力不可用时也 raise (Codex M4: 不无声失败)."""
+    cfg = cfg or RuntimeConfig()
     # 1. 杀残留 hongguo_v5.py 进程 (owner token 识别, 防误杀并发)
     try:
         stale = _find_stale_v5(exclude_token=my_token)
@@ -373,7 +410,7 @@ def cleanup_stale_resources(my_token: str, drama_dir: Path) -> None:
         raise RuntimeError(f"stale_v5_cleanup_failed: {remaining}")
 
     # 2. force-stop App (最多 3 次)
-    for _ in range(3):
+    for _ in range(cfg.force_stop_retries):
         adb_force_stop()
         time.sleep(1)
         if not adb_pidof():
@@ -636,15 +673,17 @@ def read_committed_vids(drama_dir: Path) -> dict[int, str]:
 
 # =============== NAVIGATING: 进入 ShortSeries* (design v4 §4.4 步 5-7) ===============
 
-def navigate_to_short_series(drama_dir: Path, max_retries: int = 3) -> bool:
+def navigate_to_short_series(drama_dir: Path, max_retries: int = 3,
+                              cfg: RuntimeConfig | None = None) -> bool:
     """从任意状态启动 App + 进入 ShortSeries* Activity.
     步骤: force-stop → splash → wait main → tap 进剧入口.
 
     tap 入口策略 (按顺序尝试):
       1. 动态找 "全屏观看" 文本 (首页卡片)
       2. 动态找 "继续播放" (剧场 tab 续播入口, 需先 tap 剧场)
-      3. fallback 硬编码 (570, 1281) (首页默认位置)
+      3. fallback 硬编码 cfg.fullscreen_watch_tap (首页默认位置)
     """
+    cfg = cfg or RuntimeConfig()
     for attempt in range(max_retries):
         logger.info(f"[nav] attempt {attempt+1}/{max_retries}")
 
@@ -655,17 +694,18 @@ def navigate_to_short_series(drama_dir: Path, max_retries: int = 3) -> bool:
             return True
         if 'MainFragmentActivity' not in fg:
             adb_force_stop()
-            time.sleep(2)
+            time.sleep(cfg.post_force_stop_wait)
             adb_start_app()
 
-            # Poll splash → main, 最多等 40s (MIUI 冷启动较慢)
-            for i in range(40):
+            # Poll splash → main, 最多等 cfg.splash_to_main_timeout 秒
+            for _ in range(cfg.splash_to_main_timeout):
                 time.sleep(1)
                 fg = adb_foreground()
                 if 'MainFragmentActivity' in fg or 'ShortSeries' in fg:
                     break
             else:
-                logger.warning(f"[nav] splash→main timeout 40s, fg={fg}")
+                logger.warning(f"[nav] splash→main timeout "
+                               f"{cfg.splash_to_main_timeout}s, fg={fg}")
                 continue
 
         # 已在 ShortSeries 直接返回 (cold start 可能直接进剧)
@@ -673,19 +713,14 @@ def navigate_to_short_series(drama_dir: Path, max_retries: int = 3) -> bool:
             logger.info(f"[nav] in ShortSeries after splash: {fg}")
             return True
 
-        # 已在 ShortSeries 直接返回
-        if 'ShortSeries' in fg:
-            logger.info(f"[nav] already in ShortSeries after splash: {fg}")
-            return True
-
         # Strategy 1: dump 找"全屏观看"
         ui_path = drama_dir / ".ui.xml"
-        if uiautomator_dump(ui_path, retries=2):
+        if uiautomator_dump(ui_path, retries=2, cfg=cfg):
             bounds = find_text_bounds(ui_path, "全屏观看")
             if bounds:
                 logger.info(f"[nav] tap 全屏观看 @ {bounds}")
                 adb_tap(*bounds)
-                time.sleep(4)
+                time.sleep(cfg.post_tap_wait)
                 if 'ShortSeries' in adb_foreground():
                     return True
 
@@ -694,20 +729,21 @@ def navigate_to_short_series(drama_dir: Path, max_retries: int = 3) -> bool:
             if c:
                 logger.info(f"[nav] tap 剧场 tab @ {c}")
                 adb_tap(*c)
-                time.sleep(3)
-                if uiautomator_dump(ui_path, retries=2):
+                time.sleep(cfg.post_tap_wait * 0.75)
+                if uiautomator_dump(ui_path, retries=2, cfg=cfg):
                     cp = find_text_bounds(ui_path, "继续播放")
                     if cp:
                         logger.info(f"[nav] tap 继续播放 @ {cp}")
                         adb_tap(*cp)
-                        time.sleep(4)
+                        time.sleep(cfg.post_tap_wait)
                         if 'ShortSeries' in adb_foreground():
                             return True
 
-        # Strategy 3: fallback 硬编码 (受 App 版本影响)
-        logger.info("[nav] fallback tap (570, 1281)")
-        adb_tap(570, 1281)
-        time.sleep(4)
+        # Strategy 3: fallback 硬编码坐标
+        x, y = cfg.fullscreen_watch_tap
+        logger.info(f"[nav] fallback tap ({x}, {y})")
+        adb_tap(x, y)
+        time.sleep(cfg.post_tap_wait)
         if 'ShortSeries' in adb_foreground():
             return True
 
@@ -735,7 +771,7 @@ def recover(ctx: 'AgentContext', reason: str) -> bool:
 
     # 2. 清脏状态 (stale v5 进程 + App force-stop + .tmp 孤儿)
     try:
-        cleanup_stale_resources(ctx.token, ctx.drama_dir)
+        cleanup_stale_resources(ctx.token, ctx.drama_dir, cfg=ctx.rc)
     except RuntimeError as e:
         logger.error(f"[recover] cleanup failed: {e}")
         return False
@@ -753,7 +789,7 @@ def recover(ctx: 'AgentContext', reason: str) -> bool:
             return False
 
     # 4. 启 App + 进 ShortSeries*
-    if not navigate_to_short_series(ctx.drama_dir, max_retries=2):
+    if not navigate_to_short_series(ctx.drama_dir, max_retries=2, cfg=ctx.rc):
         logger.error("[recover] navigate failed")
         return False
 
@@ -831,7 +867,7 @@ def run_verification(ctx: 'AgentContext') -> tuple[str, dict]:
                 except (ValueError, TypeError):
                     pass
 
-    rc = read_events(ctx.v5_proc, on_event, stall_timeout=90.0)
+    rc = read_events(ctx.v5_proc, on_event, stall_timeout=ctx.rc.verify_stall_timeout)
     ctx.v5_proc = None
 
     # 控制面故障 (probe subprocess 挂 / 截断 JSON 导致事件丢失)
@@ -897,7 +933,7 @@ def run_fsm(ctx: 'AgentContext') -> int:
                 logger.error("[fsm] no frida-server, abort")
                 ctx.state = State.ABORTED
                 break
-            if not navigate_to_short_series(ctx.drama_dir, max_retries=3):
+            if not navigate_to_short_series(ctx.drama_dir, max_retries=ctx.rc.nav_max_retries, cfg=ctx.rc):
                 logger.error("[fsm] init navigate failed")
                 ctx.state = State.ABORTED
                 break
@@ -905,11 +941,8 @@ def run_fsm(ctx: 'AgentContext') -> int:
 
         elif ctx.state == State.DOWNLOADING:
             # 启动 attach-resume subprocess, 读事件直到它 exit
-            if not ctx.series_id:
-                # 无 series_id 时, 先走一次 legacy (搜索) 拿 series_id (TODO: proper spawn-resolve)
-                logger.error("[fsm] no series_id, need explicit --series-id in v1 Agent")
-                ctx.state = State.ABORTED
-                break
+            # 前置保证 (main argparse required=True): ctx.series_id 一定已设
+            assert ctx.series_id, "series_id must be set before FSM enters DOWNLOADING"
 
             ctx.v5_proc = start_v5('attach-resume', ctx, start='auto')
             rc = _download_session(ctx)
@@ -963,7 +996,7 @@ def run_fsm(ctx: 'AgentContext') -> int:
                 ctx.state = State.RECOVERING
 
         elif ctx.state == State.NAVIGATING:
-            if navigate_to_short_series(ctx.drama_dir, max_retries=2):
+            if navigate_to_short_series(ctx.drama_dir, max_retries=2, cfg=ctx.rc):
                 ctx.state = State.DOWNLOADING
             else:
                 logger.warning("[fsm] NAVIGATING failed → RECOVERING")
@@ -1059,7 +1092,7 @@ def _download_session(ctx: 'AgentContext') -> int:
                          f"{ev.get('snippet', '')[:80]}")
             ctx.control_plane_corrupt_count += 1
 
-    return read_events(ctx.v5_proc, on_event, stall_timeout=60.0)
+    return read_events(ctx.v5_proc, on_event, stall_timeout=ctx.rc.download_stall_timeout)
 
 
 def _finalize(ctx: 'AgentContext') -> int:
@@ -1114,13 +1147,15 @@ class AgentContext:
     verify_result: dict | None = None
     cleanup_timeout_seen: bool = False  # Codex S4: v5 发过 cleanup_timeout
     control_plane_corrupt_count: int = 0  # Codex M2: 控制面截断次数
+    rc: RuntimeConfig = field(default_factory=RuntimeConfig)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('-n', '--name', required=True, help='剧名')
-    ap.add_argument('--series-id', type=str, default='',
-                    help='已知 series_id 跳过搜索 (强烈推荐)')
+    ap.add_argument('--series-id', type=str, required=True,
+                    help='剧 series_id (必需). 先用 `python hongguo_v5.py -n <名>` 跑一次 '
+                         '搜索路径拿到 id, 再用 Agent 无人值守下载.')
     ap.add_argument('-t', '--total', type=int, default=0, help='总集数 (可选)')
     ap.add_argument('--out', type=Path, default=DEFAULT_OUT_DIR)
     ap.add_argument('--max-retry-per-ep', type=int, default=3)
@@ -1128,6 +1163,17 @@ def main():
     ap.add_argument('--max-restarts', type=int, default=5)
     ap.add_argument('--max-total-seconds', type=int, default=3600)
     ap.add_argument('--max-stall-seconds', type=int, default=180)
+    # RuntimeConfig 关键参数 (Codex N2)
+    ap.add_argument('--splash-timeout', type=int, default=40,
+                    help='App splash→Main 最多等待秒数')
+    ap.add_argument('--tap-wait', type=float, default=4.0,
+                    help='tap 后等 Activity 切换秒数')
+    ap.add_argument('--download-stall', type=float, default=60.0,
+                    help='DOWNLOADING subprocess 无事件超时')
+    ap.add_argument('--verify-stall', type=float, default=90.0,
+                    help='VERIFYING subprocess 无事件超时')
+    ap.add_argument('--fullscreen-tap', type=str, default='570,1281',
+                    help='全屏观看按钮 fallback 坐标 "x,y"')
     args = ap.parse_args()
 
     logger.remove()
@@ -1147,6 +1193,22 @@ def main():
         ]) else 'default',
     )
 
+    # 解析 fullscreen_tap "x,y"
+    try:
+        fx, fy = (int(x.strip()) for x in args.fullscreen_tap.split(','))
+    except (ValueError, AttributeError):
+        fx, fy = 570, 1281
+        logger.warning(f"[config] 无效 --fullscreen-tap={args.fullscreen_tap!r}, "
+                       f"回退到 (570, 1281)")
+
+    rc = RuntimeConfig(
+        splash_to_main_timeout=args.splash_timeout,
+        post_tap_wait=args.tap_wait,
+        download_stall_timeout=args.download_stall,
+        verify_stall_timeout=args.verify_stall,
+        fullscreen_watch_tap=(fx, fy),
+    )
+
     ctx = AgentContext(
         drama_name=args.name,
         series_id=args.series_id or None,
@@ -1155,6 +1217,7 @@ def main():
         drama_dir=args.out / args.name,
         token=uuid.uuid4().hex,
         cb=cb,
+        rc=rc,
     )
     ctx.drama_dir.mkdir(parents=True, exist_ok=True)
 
