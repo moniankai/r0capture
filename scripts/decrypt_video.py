@@ -156,21 +156,31 @@ def fix_metadata(data: bytearray) -> None:
     1. Restore original codec (encv→hvc1/bvc2, enca→mp4a) from frma.
     2. Zero-fill and remove each sinf box so players don't see residual DRM markers.
     """
-    # 回退 frma codec sinf 
+    # 回退 frma codec sinf
+    # 合法 sinf box 大小上限: 实测 <200B,放宽到 4KB 兜底,避免 encrypted sample
+    # 里偶然出现的 "sinf" 字节序列被当成真 sinf (其 "size" 字段可能是任意巨数)
+    SINF_SIZE_MAX = 4 * 1024
     sinf_ranges: list[tuple[int, int]] = []
     pos = 0
     while True:
         idx = data.find(b"sinf", pos)
         if idx < 0:
             break
+        if idx < 4:  # size 字段需要前 4 字节
+            pos = idx + 4
+            continue
         sinf_start = idx - 4
         sinf_size = struct.unpack(">I", data[sinf_start : sinf_start + 4])[0]
+        # 合理性校验: 8 <= size <= SINF_SIZE_MAX 且 sinf_end 不超出 data
+        if sinf_size < 8 or sinf_size > SINF_SIZE_MAX \
+                or sinf_start + sinf_size > len(data):
+            pos = idx + 4
+            continue
         sinf_end = sinf_start + sinf_size
 
-        frma = data.find(b"frma", idx)
+        frma = data.find(b"frma", idx, sinf_end)
         if 0 <= frma < sinf_end:
             orig_fmt = bytes(data[frma + 4 : frma + 8])
-            # 处理 sinf encv/enca sample entry
             for s in range(sinf_start - 4, max(sinf_start - 2000, 0), -1):
                 if bytes(data[s + 4 : s + 8]) in (b"encv", b"enca"):
                     logger.info(f"Fix: {data[s+4:s+8].decode()} -> {orig_fmt.decode()}")
@@ -180,14 +190,9 @@ def fix_metadata(data: bytearray) -> None:
         sinf_ranges.append((sinf_start, sinf_end))
         pos = idx + 4
 
-    # 处理 sinf box处理
+    # sinf box → free
     for start, end in reversed(sinf_ranges):
         size = end - start
-        # stsd sample-entry box 
-        # sinf sample-entry encv/hvc1 size 
-        # entry 4 处理处理
-        # 处理 size 处理 sinf 处理
-        # type to 'free' (a standard MP4 skip box) — simpler and equally effective.
         data[start + 4 : start + 8] = b"free"
         data[start + 8 : end] = b"\x00" * (size - 8)
         logger.info(f"sinf at {start} ({size}B) -> free box")
