@@ -3,8 +3,38 @@
 **目标**: 输入剧名 + series_id → Agent 全自动下载完整剧集 + 对齐验证 + 产出报告, 无需人工干预。
 
 **架构**: 分层设计 (详见 [`docs/superpowers/specs/2026-04-18-hongguo-agent-design.md`](../docs/superpowers/specs/2026-04-18-hongguo-agent-design.md))
+- `hongguo_batch.py` — BatchAgent (多剧串行调度 + 设备自愈 + resume)
 - `hongguo_agent.py` — Orchestrator (FSM + Watchdog + Recovery + 熔断)
-- `hongguo_v5.py` — 可监督的 runner (3 种启动模式 + 事件流 + 原子提交)
+- `hongguo_v5.py` — 可监督的 runner (4 种启动模式 + 事件流 + 原子提交 + ot3.z.B0 强绑定 Hook)
+
+## 批量模式 (阶段 2a)
+
+```bash
+# 准备输入 JSON (scripts/dramas.example.json 为模板)
+python scripts/hongguo_batch.py --input dramas.json
+
+# Resume (默认会跳过已 DONE 的剧, 无需额外参数)
+python scripts/hongguo_batch.py --input dramas.json
+
+# 可选参数
+#   --per-drama-timeout 2400     单部剧上限 秒 (默认 1800)
+#   --reboot-every 5             每 N 部强制 adb reboot (默认 5, 0 = 关)
+#   --halt-on-fatal              某部 FATAL/TIMEOUT 时停止整批 (默认继续)
+#   --fresh                      忽略 .batch_state.json 重新跑 (仍跳磁盘已完成)
+```
+
+输入 JSON 格式:
+```json
+[
+  {"name": "我真不是大佬啊", "series_id": "7625840320642567192", "total": 88},
+  {"name": "凡人仙葫", "series_id": "7617050216549583897", "total": 60}
+]
+```
+
+输出:
+- `videos/<每部剧>/` — 每部剧的 mp4 + manifest + report
+- `.batch_state.json` — 进度持久化 (中断后 resume)
+- `batch_report.json` — 最终汇总 (ok/skipped/failed/total_reboots/elapsed)
 
 ---
 
