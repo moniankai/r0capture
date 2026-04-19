@@ -58,8 +58,8 @@ V5_EXIT_PRECOND = 5
 @dataclass
 class RuntimeConfig:
     """关键运行时参数. 默认值基于 MIUI/Android 9 实测, CLI 可覆盖."""
-    # App 启动 / 导航
-    splash_to_main_timeout: int = 40       # splash → main/ShortSeries 最多等 (秒)
+    # App 启动 / 导航 (某些机器+MIUI 冷启动 >60s, 留 90s 边际)
+    splash_to_main_timeout: int = 90       # splash → main/ShortSeries 最多等 (秒)
     post_tap_wait: float = 4.0             # tap 后等 Activity 切换
     post_force_stop_wait: float = 2.0      # force_stop 后等 App 进程清理
     nav_max_retries: int = 3               # navigate_to_short_series 主循环重试数
@@ -220,16 +220,24 @@ def _adb_env() -> dict:
 
 
 def adb_shell(cmd: str | list[str], timeout: float = 8.0) -> tuple[int, str]:
-    """adb shell 执行, 返回 (returncode, stdout). timeout 视为 (-1, '')."""
+    """adb shell 执行, 返回 (returncode, stdout). timeout/error 视为 (-1, '').
+    Codex D4: timeout/OSError 时 log warning (之前静默返回丢失可调试信号).
+    """
     if isinstance(cmd, str):
         full = ["adb", "shell", cmd]
+        cmd_str = cmd
     else:
         full = ["adb", "shell"] + cmd
+        cmd_str = ' '.join(cmd)
     try:
         r = subprocess.run(full, capture_output=True, text=True,
-                           env=_adb_env(), timeout=timeout)
+                           env=_adb_env(), timeout=timeout, close_fds=True)
         return r.returncode, (r.stdout or '').replace('\r', '')
-    except (subprocess.TimeoutExpired, OSError):
+    except subprocess.TimeoutExpired:
+        logger.warning(f"[adb] timeout {timeout}s: {cmd_str[:80]}")
+        return -1, ''
+    except OSError as e:
+        logger.warning(f"[adb] OSError: {e} cmd={cmd_str[:80]}")
         return -1, ''
 
 
@@ -516,6 +524,7 @@ def start_v5(mode: str, ctx: 'AgentContext', **extra_args) -> subprocess.Popen:
         text=True,
         encoding='utf-8',
         errors='replace',
+        close_fds=True,   # Codex D3: 防长跑 fd 泄漏
     )
     if sys.platform == 'win32':
         kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -1247,8 +1256,8 @@ def main():
     ap.add_argument('--max-total-seconds', type=int, default=3600)
     ap.add_argument('--max-stall-seconds', type=int, default=180)
     # RuntimeConfig 关键参数 (Codex N2)
-    ap.add_argument('--splash-timeout', type=int, default=40,
-                    help='App splash→Main 最多等待秒数')
+    ap.add_argument('--splash-timeout', type=int, default=90,
+                    help='App splash→Main 最多等待秒数 (MIUI 冷启动常 >40s)')
     ap.add_argument('--tap-wait', type=float, default=4.0,
                     help='tap 后等 Activity 切换秒数')
     ap.add_argument('--download-stall', type=float, default=60.0,
@@ -1324,6 +1333,18 @@ def main():
             safe_kill_subprocess_tree(ctx.v5_proc, timeout=3.0)
         _finalize(ctx)
         return 4
+    except SystemExit:
+        raise  # pytest / sys.exit 明确调用不截
+    except BaseException as e:
+        # Codex D2: silently exit 诊断 - 任何非预期异常都打完整栈 + finalize
+        logger.exception(f"[agent] uncaught {type(e).__name__}: {e}")
+        try:
+            if ctx.v5_proc is not None:
+                safe_kill_subprocess_tree(ctx.v5_proc, timeout=3.0)
+            _finalize(ctx)
+        except Exception:
+            logger.exception("[agent] finalize also failed")
+        return 3
 
 
 if __name__ == '__main__':
