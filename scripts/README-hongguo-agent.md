@@ -36,6 +36,32 @@ python scripts/hongguo_batch.py --input dramas.json
 - `.batch_state.json` — 进度持久化 (中断后 resume)
 - `batch_report.json` — 最终汇总 (ok/skipped/failed/total_reboots/elapsed)
 
+## 交互式抓 series_id (阶段 2b 半自动)
+
+对 100+ 部规模, 手动找每部 series_id 费时. 用 `resolve_interactive.py` 半自动:
+
+```bash
+# 1. 在手机上打开红果 App (任意页)
+# 2. 运行工具 (attach frida 监听剧数据 hook)
+python scripts/resolve_interactive.py --out dramas.json
+
+# 3. 在 App 里任意浏览 — 首页 / 剧场 / 搜索 / 历史记录 都会触发剧信息加载
+#    每新抓一部剧, 工具会实时打印
+# 4. 全部浏览完按 Ctrl-C, 自动 merge 写入 dramas.json
+
+# 过滤关键词 (只记录剧名含指定词的)
+python scripts/resolve_interactive.py --out dramas.json --filter "凡人仙葫,风水,大佬"
+
+# 最小集数 (过滤短剧 / 预告)
+python scripts/resolve_interactive.py --out dramas.json --min-total 20
+```
+
+Hook 原理: 监听 `SaasVideoData.setSeriesName / setSeriesId / setEpisodesCount`
+和 `holder.a/z.j2` bind, 每次 App 加载一部剧 (无论走哪个入口) 都能抓到
+`{series_id, name, total, first_vid}`. 完全不用 uiautomator, 避免设备卡死.
+
+工具输出 `dramas.json` 直接可作为 BatchAgent 的 `--input`.
+
 ---
 
 ## 依赖
