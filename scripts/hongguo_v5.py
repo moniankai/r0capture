@@ -166,8 +166,9 @@ Java.perform(function() {
     }
 
     var TTE = Java.use('com.ss.ttvideoengine.TTVideoEngine');
+
     function handleModel(m) {
-        // Lazy hook ot3.z.B0: setVideoModel 被调时 ot3.z 一定已加载 (B0 是 caller)
+        // Lazy hook ot3.z.B0 (B0 是 setVideoModel caller, 所以 ot3.z 必然已加载)
         _hookOt3ZB0Once();
         if (!m) return;
         try {
@@ -338,6 +339,9 @@ Java.perform(function() {
                 return ov.apply(this, args);
             };
         });
+        // 强制 JIT deopt: 已 JIT 的 method 可能忽略 frida hook replacement,
+        // deopt 让所有 method 走解释执行, 下次 B0 call 走我们的 implementation
+        try { Java.deoptimizeEverything(); } catch(e) {}
         send({t: 'play_hook_ok', overloads: Z.B0.overloads.length});
         } catch(e) {
             // ot3.z 还未加载 (lazy classload): _b0_hooked 保持 false,
@@ -818,9 +822,37 @@ class State:
         with self.lock:
             self.by_kid[kid] = cap
             self.cap_queue.append(cap)
-            # 防爆: 保留最近 200 条
             if len(self.cap_queue) > 200:
                 self.cap_queue = self.cap_queue[-200:]
+
+            # 合成 PlayRecord: 关联最近一条 series 匹配 + 未用 kid 的 BIND.
+            # 因为 ot3.z.B0 hook 在 App 静止后再 RPC 时不一定 fire (frida JIT 或
+            # call chain 变化), 改在 Python 侧关联 BIND + CAP. 关联策略:
+            #   - 找 bind_queue 里 series_id 匹配 target 的最新 bind
+            #   - ts 差 < 2 秒 (同一次切集)
+            #   - idx 未出现在 committed_eps 里 (避免复用老 bind)
+            if self.target_series_id:
+                best = None
+                for b in reversed(self.bind_queue):
+                    if b.series_id != self.target_series_id:
+                        continue
+                    if abs(b.ts - cap.ts) > 2.0 and cap.ts > 0 and b.ts > 0:
+                        continue
+                    best = b
+                    break
+                if best:
+                    pr = PlayRecord(
+                        biz_vid=best.vid or '', idx=best.idx,
+                        title=best.title or '',
+                        series_id=best.series_id or '',
+                        tt_vid=cap.vid, kid=cap.kid,
+                        spadea=cap.spadea, key=cap.key,
+                        streams=cap.streams, ts=cap.ts,
+                        switch_seq=cap.switch_seq,
+                    )
+                    self.play_queue.append(pr)
+                    if len(self.play_queue) > 200:
+                        self.play_queue = self.play_queue[-200:]
         return True
 
     def ingest_bind(self, p: dict) -> Bind | None:
@@ -1873,35 +1905,71 @@ def _download_main(args) -> int:
     try:
         expected_total = args.total if args.total > 0 else None
         if args.series_id:
-            # 跳过搜索,直接用给定 series_id RPC 进剧 pos=0 (即 ep1)
-            logger.info(f"[v5] 跳过搜索,直接进 series_id={args.series_id}")
+            logger.info(f"[v5] 跳过搜索, series_id={args.series_id}")
             state.target_series_id = args.series_id
             state.target_series_name = args.name
             state.total_eps = args.total or 0
-            nav_seq = state.next_switch_seq()
-            r = rpc_switch(script, args.series_id, None, 0, nav_seq, timeout=15.0)
-            logger.info(f"[nav direct] rpc ok={r.get('ok')} ctx={r.get('ctx')} "
-                        f"err={r.get('err')} timeout={r.get('timeout')}")
-            if not r.get('ok'):
-                logger.error(f"RPC failed: {r.get('err')}")
-                emit('fatal', detail=f'nav_rpc_err:{r.get("err")}')
-                return EXIT_ANR_SUSPECTED if r.get('timeout') else EXIT_FATAL
 
-            # 等 BIND 确认
-            deadline = time.time() + 30
-            b0 = None
-            while time.time() < deadline:
-                b0 = state.wait_first_valid_bind(min_total_eps=1, timeout=1.0, min_seq=nav_seq)
-                if b0 and b0.series_id == args.series_id:
-                    logger.info(f"[nav] BIND ep={b0.idx} total={b0.total_eps} "
-                                f"seq={b0.switch_seq}")
-                    break
+            # 阶段 1: 等自然 BIND (App 若已在目标剧, ViewHolder 的 j2 bind 可能已在
+            # hook 加载时刻被触发; 也可能 App 刚 attach 完第一次 fresh render).
+            # 接受 switch_seq=0 (无 RPC 触发) 的 BIND, 只要 series_id 匹配.
+            logger.info("[nav] 阶段 1: 等自然 BIND (3s)")
+            b0 = state.wait_first_valid_bind(min_total_eps=1, timeout=3.0, min_seq=0)
+            if b0 and b0.series_id == args.series_id:
+                logger.info(f"[nav] 自然 BIND ok ep={b0.idx} total={b0.total_eps} "
+                            f"seq={b0.switch_seq}")
+                state.total_eps = b0.total_eps
+            else:
+                # 阶段 2: RPC openShortSeriesActivity(pos=0) 强制切
+                nav_seq = state.next_switch_seq()
+                logger.info(f"[nav] 阶段 2: RPC pos=0 seq={nav_seq}")
+                r = rpc_switch(script, args.series_id, None, 0, nav_seq, timeout=15.0)
+                logger.info(f"[nav] rpc ok={r.get('ok')} ctx={r.get('ctx')} "
+                            f"err={r.get('err')} timeout={r.get('timeout')}")
+                if not r.get('ok'):
+                    emit('fatal', detail=f'nav_rpc_err:{r.get("err")}')
+                    return EXIT_ANR_SUSPECTED if r.get('timeout') else EXIT_FATAL
+                # 等 BIND
+                deadline = time.time() + 20
                 b0 = None
-            if not b0:
-                logger.error("BIND 未到")
-                emit('fatal', detail='nav_bind_timeout')
-                return EXIT_ANR_SUSPECTED
-            state.total_eps = b0.total_eps
+                while time.time() < deadline:
+                    b0 = state.wait_first_valid_bind(
+                        min_total_eps=1, timeout=1.0, min_seq=nav_seq)
+                    if b0 and b0.series_id == args.series_id:
+                        logger.info(f"[nav] RPC BIND ep={b0.idx} "
+                                    f"total={b0.total_eps} seq={b0.switch_seq}")
+                        break
+                    b0 = None
+
+                # 阶段 3: RPC no-op fallback — swipe 强制 ViewPager 切集 触发
+                # setVideoModel + ot3.z.B0 lazy hook + BIND fire.
+                # 切到的可能是相邻 ep (非 ep1), 但 b0 拿到的 idx 会是实际集.
+                if not b0:
+                    logger.warning("[nav] 阶段 3: swipe fallback")
+                    try:
+                        subprocess.run(
+                            ['adb', 'shell', 'input swipe 540 1400 540 400 300'],
+                            capture_output=True, timeout=3,
+                            env={**os.environ, 'MSYS_NO_PATHCONV': '1'})
+                    except (subprocess.TimeoutExpired, OSError):
+                        pass
+                    time.sleep(2.0)
+                    # swipe 产生的 BIND seq 仍是 nav_seq (JS currentSwitchSeq)
+                    deadline2 = time.time() + 15
+                    while time.time() < deadline2:
+                        b0 = state.wait_first_valid_bind(
+                            min_total_eps=1, timeout=1.0, min_seq=0)
+                        if b0 and b0.series_id == args.series_id:
+                            logger.info(f"[nav] swipe BIND ep={b0.idx} "
+                                        f"total={b0.total_eps}")
+                            break
+                        b0 = None
+
+                if not b0:
+                    logger.error("nav 所有阶段失败, BIND 未到")
+                    emit('fatal', detail='nav_bind_timeout')
+                    return EXIT_ANR_SUSPECTED
+                state.total_eps = b0.total_eps
         else:
             b0 = navigate_to_drama(args.name, state, script, timeout=30,
                                     expected_total=expected_total)
@@ -1933,13 +2001,13 @@ def _download_main(args) -> int:
         ok = 0
         fail = 0
         # 已用过的 cap.kid — 防止同一 cap 多次下载 → 串集.
-        # 强绑定 play 路径: 每次 ot3.z.B0 emit {biz_vid, tt_vid, kid} 都唯一对应一集,
-        # used_kids 是二级保险 (kid 已用过就不再当新集的候选).
-        # **跨 session 持久化**: 读 manifest 里所有 committed ep 的 kid8, 注入 used_kids.
-        # 旧 bind+cap 路径的串集根因之一就是 session-local used_kids 不持久.
+        # session-local full kid (32 字符), 不从 manifest 预装 kid8 (kid8 前缀
+        # 碰撞严重, 实测 80 集只有 29 种 kid8 → 误排除新 cap).
+        # 防串集靠 committed_at_start skip (已 committed ep 直接跳过) +
+        # wait_cap_for_seq 严格 seq + 无 fallback.
         committed_kid_map = read_committed_eps(out_dir)
         committed_at_start = set(committed_kid_map.keys())
-        used_kids: set[str] = set(committed_kid_map.values())  # 初始 = 历史 kid8 prefixes
+        used_kids: set[str] = set()
         current_ep = b0.idx
 
         new_downloads = 0
@@ -1968,41 +2036,51 @@ def _download_main(args) -> int:
                          reason=f'rpc_err:{r.get("err")}')
                     fail += 1
                     continue
-                # RPC 后等 ot3.z.B0 被调 → play 事件入队
-                pr = state.wait_play_for_idx(target_ep, timeout=8.0,
+                # RPC 切集后, tap 屏幕中间激活播放 (RPC 把 ViewHolder 切过去但不
+                # 一定自动 play, setVideoModel 需要"播放中"状态才 fire).
+                try:
+                    subprocess.run(
+                        ['adb', 'shell', 'input tap 540 960'],
+                        capture_output=True, timeout=3,
+                        env={**os.environ, 'MSYS_NO_PATHCONV': '1'})
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+                # BIND+CAP 合成 play: 显式按 target_ep 拿 BIND (idx 匹配),
+                # 按 target_seq 拿 CAP (seq 严格 + exclude_kids). 不依赖
+                # ot3.z.B0 hook (该 hook 对 App 静止后重复切集不稳).
+                tgt_bind = state.wait_bind_for_series_seq(
+                    state.target_series_id, target_ep, target_seq, timeout=10.0)
+                if not tgt_bind:
+                    # 降级: preload 已 bind 过 (idx 匹配但 seq 可能 <= target_seq)
+                    with state.lock:
+                        reuse = [b for b in state.bind_queue
+                                 if b.series_id == state.target_series_id
+                                 and b.idx == target_ep and b.switch_seq >= 1]
+                    if reuse:
+                        tgt_bind = max(reuse, key=lambda b: b.ts)
+
+                cap = state.wait_cap_for_seq(target_seq, expected_vid=None,
+                                              timeout=10.0,
                                               exclude_kids=used_kids)
-                # Fallback: RPC no-op (App ViewPager prefetch 命中, 不 fire setVideoModel).
-                # 双段 RPC: 先切远距离 pos (必然离开 prefetch range, 触发 B0),
-                # 再切回 target (新 pos 差 > 1, App 必须新建 VideoModel).
-                if not pr:
-                    # 选一个和 target 相差 ≥20 的远 pos; total 不足时用另一端
-                    total = state.total_eps or (args.total or 88)
-                    if target_ep > 25:
-                        far_pos = 0                    # target 在后半段, 远 pos 切头
-                    elif target_ep < total - 25:
-                        far_pos = total - 1            # target 在前半段, 远 pos 切尾
-                    else:
-                        far_pos = 0
-                    logger.warning(f"[ep{target_ep}] RPC no-op, 双段 RPC: "
-                                   f"先 pos={far_pos} 再切回 pos={pos}")
-                    # 段 1: 切远 pos, 激活 B0 + 离开 prefetch
-                    far_seq = state.next_switch_seq()
-                    r1 = rpc_switch(script, state.target_series_id, None, far_pos,
-                                     far_seq, timeout=15.0)
-                    if r1.get('ok'):
-                        time.sleep(2.0)  # 等 App rebind + B0 fire (触发 lazy hook)
-                    # 段 2: 切回 target
-                    retry_seq = state.next_switch_seq()
-                    r2 = rpc_switch(script, state.target_series_id, None, pos,
-                                     retry_seq, timeout=15.0)
-                    if r2.get('ok'):
-                        pr = state.wait_play_for_idx(target_ep, timeout=10.0,
-                                                      exclude_kids=used_kids)
+                pr = None
+                if tgt_bind and cap:
+                    pr = PlayRecord(
+                        biz_vid=tgt_bind.vid or '',
+                        idx=tgt_bind.idx,
+                        title=tgt_bind.title or '',
+                        series_id=tgt_bind.series_id or '',
+                        tt_vid=cap.vid, kid=cap.kid,
+                        spadea=cap.spadea, key=cap.key,
+                        streams=cap.streams, ts=cap.ts,
+                        switch_seq=cap.switch_seq,
+                    )
+                    logger.info(f"[ep{target_ep}] 合成 play: biz={pr.biz_vid[:14]}... "
+                                f"kid={pr.kid[:12]}... idx={pr.idx}")
             if not pr:
-                logger.warning(f"[ep{target_ep}] play_timeout "
-                               f"(ot3.z.B0 未被调用, swipe+RPC 亦失败)")
-                # play_timeout 归为 infra: Agent 会累 consec_fail → recovery
-                emit('ep_fail', ep=target_ep, reason='play_timeout')
+                logger.warning(f"[ep{target_ep}] fail: "
+                               f"bind={bool(tgt_bind)} cap={bool(cap)}")
+                emit('ep_fail', ep=target_ep,
+                     reason='bind_timeout' if not tgt_bind else 'cap_timeout')
                 fail += 1
                 continue
 
