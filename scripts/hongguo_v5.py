@@ -210,7 +210,10 @@ Java.perform(function() {
                 return;
             }
             var key = spadeaToKey(spadea);
-            send({t:'cap', kid:kid, spadea:spadea, key:key, streams:streams,
+            // vid 用于和 BIND 的 vid 对齐 (防串集). VideoModel.getVideoRefStr(202) = video_id.
+            var vid = '';
+            try { vid = String(m.getVideoRefStr(202) || ''); } catch(e) {}
+            send({t:'cap', kid:kid, spadea:spadea, key:key, streams:streams, vid:vid,
                   ts:Date.now(), switch_seq: currentSwitchSeq});
         } catch(e) { send({t:'err', msg:e.toString()}); }
     }
@@ -577,6 +580,7 @@ class Capture:
     kid: str
     spadea: str
     key: str
+    vid: str = ''        # 从 VideoModel.getVideoRefStr(202) 取, 用于和 BIND.vid 对齐 (防串集)
     streams: list = field(default_factory=list)
     ts: float = 0.0
     switch_seq: int = 0   # 事件携带的切集序号(JS 侧 currentSwitchSeq 值)
@@ -641,6 +645,7 @@ class State:
             logger.info(f"[集群] 记录首 ID={cid} (不过滤, 仅供参考)")
         cap = Capture(
             kid=kid, spadea=p['spadea'], key=p.get('key') or '',
+            vid=(p.get('vid') or '').strip(),
             streams=p.get('streams') or [],
             ts=(p.get('ts') or 0) / 1000.0,
             switch_seq=int(p.get('switch_seq') or 0),
@@ -829,29 +834,37 @@ class State:
             time.sleep(0.2)
         return None
 
-    def wait_cap_for_seq(self, min_seq: int, timeout: float = 8.0,
+    def wait_cap_for_seq(self, min_seq: int,
+                         expected_vid: str | None = None,
+                         timeout: float = 8.0,
                          settle: float = 0.0,
                          exclude_kids: set[str] | None = None) -> Capture | None:
-        """等 switch_seq >= min_seq 的 cap. 返回 **首个** 匹配项.
-        RPC 模式下,切集后 setVideoModel fire 顺序是:
-          fire 1 = 当前请求集 (N) → 这就是我们要的
-          fire 2+ = App 预加载的下一集 (N+1, N+2) ← 要忽略,否则 off-by-one
-        若 timeout 内没等到匹配 seq,fallback 到最新未使用 cap.
+        """等 switch_seq >= min_seq 且 vid==expected_vid 的 cap. 返回 **首个** 匹配项.
+
+        expected_vid: 此次目标集的 BIND.vid. 传入后, CAP 必须带同 vid 才认.
+            这是防串集的核心校验 (Hook 的 CAP 来自 setVideoModel, 和 BIND 的
+            SaasVideoData 是两条管线, 只靠 switch_seq 不够 — preload/nav 残留的
+            cap 也可能落在 min_seq 窗口内, 导致 ep80 下到 ep1 的内容).
+            传 None 则退化为旧行为 (只看 seq, 用于兼容测试).
+
+        注意: 已移除旧 fallback "拿任意 seq>=1 未用 kid 的 cap".
+            拿不到匹配 cap 直接返回 None, 调用方应标 ep_fail.
         """
         exclude_kids = exclude_kids or set()
         deadline = time.time() + timeout
         while time.time() < deadline:
             with self.lock:
                 for c in self.cap_queue:  # 顺序(首个优先)
-                    if c.switch_seq >= min_seq and c.kid not in exclude_kids:
-                        return c
-            time.sleep(0.05)
-        # Fallback: seq=0 是启动 feed(可能是任意其他剧),必排除.
-        # 允许 seq < min_seq 但 >= 1 的 cap (可能是目标剧 preload 早于本次 RPC)
-        with self.lock:
-            for c in reversed(self.cap_queue):
-                if c.switch_seq >= 1 and c.kid not in exclude_kids:
+                    if c.switch_seq < min_seq:
+                        continue
+                    if c.kid in exclude_kids:
+                        continue
+                    if expected_vid is not None:
+                        # 严格对齐: cap.vid 必须非空且等于目标 vid
+                        if not c.vid or c.vid != expected_vid:
+                            continue
                     return c
+            time.sleep(0.05)
         return None
 
 
@@ -1714,17 +1727,22 @@ def _download_main(args) -> int:
             seen_ep_vids.add(ep_vid_key)
             current_ep = target_ep
 
-            # 等匹配 cap(switch_seq >= target_seq), settle 内消费后续
-            # fallback: 若预加载 cap 早到, exclude used_kids 后取最新
+            # 等匹配 cap: 必须 vid == tgt_bind.vid (防串集), switch_seq >= target_seq
             cap_timeout = 15.0 if use_b0 else 8.0  # ep1 nav 后首次 Activity 启动慢
-            cap = state.wait_cap_for_seq(target_seq, timeout=cap_timeout, settle=1.5,
+            cap = state.wait_cap_for_seq(target_seq,
+                                          expected_vid=tgt_bind.vid,
+                                          timeout=cap_timeout, settle=1.5,
                                           exclude_kids=used_kids)
             if not cap:
-                logger.warning(f"[ep{target_ep}] 无匹配 cap (seq={target_seq})")
+                logger.warning(f"[ep{target_ep}] 无匹配 cap "
+                               f"(vid={tgt_bind.vid[:14]}... seq={target_seq})")
+                emit('ep_fail', ep=target_ep, reason='cap_vid_mismatch',
+                     expected_vid=tgt_bind.vid, target_seq=target_seq)
                 fail += 1
                 continue
             used_kids.add(cap.kid)
-            logger.info(f"[ep{target_ep}] cap kid={cap.kid[:12]}... seq={cap.switch_seq}")
+            logger.info(f"[ep{target_ep}] cap kid={cap.kid[:12]}... "
+                        f"vid={cap.vid[:14]}... seq={cap.switch_seq}")
 
             # design doc v4 §3.5 严格提交顺序:
             #   步 1-5 download_and_decrypt (内存解密 → .tmp/ fsync → rename → final)
