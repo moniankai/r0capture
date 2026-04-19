@@ -879,7 +879,9 @@ class State:
                 for c in self.cap_queue:  # 顺序(首个优先)
                     if c.switch_seq < min_seq:
                         continue
-                    if c.kid in exclude_kids:
+                    # exclude_kids 可能混 full 32 字符 kid (session-local) 和
+                    # 8 字符 prefix (manifest committed kid). 双匹配.
+                    if c.kid in exclude_kids or c.kid[:8] in exclude_kids:
                         continue
                     return c
             time.sleep(0.05)
@@ -1598,6 +1600,9 @@ def main():
     ap.add_argument('--out', type=Path, default=DEFAULT_OUT_DIR)
     ap.add_argument('--attach', action='store_true',
                     help='(legacy mode) attach 到运行中的 App')
+    ap.add_argument('--batch-size', type=int, default=0,
+                    help='本次 session 最多下 N 个新 ep 后主动 exit (0=不限). '
+                         '用于绕 Frida 单 session 累积 ANR. Agent 编排专用.')
     # v4 新增: Agent 编排专用 mode
     ap.add_argument('--mode', choices=['legacy', 'spawn-resolve', 'attach-resume',
                                         'probe-bind', 'walk-only'],
@@ -1704,11 +1709,24 @@ def _download_main(args) -> int:
         ok = 0
         fail = 0
         seen_ep_vids: set[tuple[int, str]] = set()  # (ep, vid) 联合去重
-        used_kids: set[str] = set()   # 已用过的 cap.kid, 防止同一 cap 多次下载
+        # 已用过的 cap.kid — 防止同一 cap 多次下载 → 串集.
+        # **跨 session 持久化**: 读 manifest 里所有 committed ep 的 kid8, 注入 used_kids.
+        # 否则: Agent 每次 recovery 新建 session, used_kids 清空; 若 preload 延迟入队
+        # 带了新 seq, 旧 ep 的 cap 会被再次挑中, 下到新 ep 变成内容重复 (实测串集模式).
+        # used_kids 里同时放 kid8 (8 字符 prefix from manifest) 和 full 32 字符 kid
+        # (session 内下载成功的 cap.kid). wait_cap_for_seq 做双匹配 (full or prefix).
+        committed_kid_map = read_committed_eps(out_dir)
+        committed_at_start = set(committed_kid_map.keys())
+        used_kids: set[str] = set(committed_kid_map.values())  # 初始 = 历史 kid8 prefixes
         current_ep = b0.idx
+
+        new_downloads = 0
+        batch_size = int(getattr(args, 'batch_size', 0) or 0)
 
         # 循环: 每集分配一个 switch_seq → RPC → 等匹配 BIND → 等匹配 cap → 下载
         for target_ep in range(start_ep, end + 1):
+            if target_ep in committed_at_start:
+                continue  # 已下且文件完好, skip
             # 首集特判: 已经通过 navigate 进入, b0 就是我们要的
             use_b0 = (current_ep == b0.idx and target_ep == b0.idx
                       and target_ep == start_ep)
@@ -1782,17 +1800,13 @@ def _download_main(args) -> int:
                     logger.info(f"[ep{target_ep}] walk-only 降级复用 preload cap "
                                 f"seq={cap.switch_seq}")
             if not cap:
-                logger.warning(f"[ep{target_ep}] 无匹配 cap "
-                               f"(vid={tgt_bind.vid[:14]}... seq={target_seq})")
-                # 诊断: 打印 cap_queue 最近 5 条, 看是否 tt_vid 和 biz_vid 差异
-                with state.lock:
-                    recent = list(state.cap_queue[-5:])
-                for c in recent:
-                    logger.warning(f"  cap_queue: kid={c.kid[:12]} "
-                                   f"vid={c.vid!r} seq={c.switch_seq}")
-                emit('ep_fail', ep=target_ep, reason='cap_vid_mismatch',
-                     expected_vid=tgt_bind.vid, target_seq=target_seq,
-                     recent_cap_vids=[c.vid for c in recent])
+                logger.warning(f"[ep{target_ep}] cap_timeout "
+                               f"(bind_vid={tgt_bind.vid[:14]}... target_seq={target_seq})")
+                # reason='cap_timeout' 归类为 infra → Agent 累 consec_fail → 达阈值
+                # 就触发 recovery (force-stop App + restart frida), 以绕 ViewPager
+                # 复用 holder 导致 setVideoModel 不 fire 的 no-op 场景.
+                emit('ep_fail', ep=target_ep, reason='cap_timeout',
+                     target_seq=target_seq)
                 fail += 1
                 continue
             used_kids.add(cap.kid)
@@ -1833,8 +1847,15 @@ def _download_main(args) -> int:
                 continue
 
             ok += 1
+            new_downloads += 1
             emit('ep_ok', ep=target_ep, vid=tgt_bind.vid, kid=cap.kid,
                  bytes=rec['bytes'], series_id=state.target_series_id)
+
+            # batch_size 限制: 下够 N 个新 ep 后主动退出让 Agent 重建 session
+            # 绕 Frida 单 session 多集累积 ANR (B4 实测发现)
+            if batch_size > 0 and new_downloads >= batch_size:
+                logger.info(f"[v5] 达 batch_size={batch_size}, 主动 exit 让 Agent 重建")
+                break
 
         logger.info(f"[v5 完成] ok={ok} fail={fail} / 目标 {end - start_ep + 1}")
         emit('done', ok=ok, fail=fail, last_ep=current_ep,

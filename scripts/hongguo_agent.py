@@ -986,13 +986,18 @@ def run_fsm(ctx: 'AgentContext') -> int:
             assert ctx.series_id, "series_id must be set before FSM enters DOWNLOADING"
 
             # Bug fix: 小批次策略 绕 v5 Frida 主线程累积 ANR
-            # 每 session 下 batch_size 集后主动 exit, Agent 重建 session
+            # 每 session 下 batch_size 个新 ep 后主动 exit, Agent 重建 session.
+            # v5 侧负责 skip 已 committed 的 ep (防 manifest 有缺口时重下), 并在
+            # 下够 batch_size 个新 ep 后 break. Agent 只需传 end=total.
             committed = read_committed_eps(ctx.drama_dir)
-            last_ok = max(committed.keys()) if committed else 0
-            batch_end = min(ctx.total or 999, last_ok + ctx.rc.batch_size_per_session)
-            logger.info(f"[fsm] batch download last_ok={last_ok} → {batch_end} "
-                        f"(batch_size={ctx.rc.batch_size_per_session})")
-            ctx.v5_proc = start_v5('attach-resume', ctx, start='auto', end=batch_end)
+            missing = [ep for ep in range(1, (ctx.total or 0) + 1)
+                       if ep not in committed]
+            next_batch = missing[:ctx.rc.batch_size_per_session]
+            logger.info(f"[fsm] batch download missing={len(missing)} "
+                        f"next={next_batch} (batch_size={ctx.rc.batch_size_per_session})")
+            ctx.v5_proc = start_v5('attach-resume', ctx, start='auto',
+                                    end=(ctx.total or 0),
+                                    batch_size=ctx.rc.batch_size_per_session)
             rc = _download_session(ctx)
             ctx.v5_proc = None
 
