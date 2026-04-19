@@ -1098,32 +1098,40 @@ class State:
                          expected_vid: str | None = None,
                          timeout: float = 8.0,
                          settle: float = 0.0,
-                         exclude_kids: set[str] | None = None) -> Capture | None:
-        """等 switch_seq >= min_seq 的 cap. 返回 **首个** 匹配项.
+                         exclude_kids: set[str] | None = None,
+                         target_bind_ts: float | None = None) -> Capture | None:
+        """等 switch_seq >= min_seq 的 cap.
 
-        防串集的核心修复是两点:
-        1. **严格 seq 过滤** (`switch_seq >= min_seq`): 只认本次 RPC 或更新触发的 CAP,
-           忽略上次切集 / nav 阶段残留
-        2. **无 fallback** (删除了旧的 "拿任意 seq>=1 未用 kid 的 cap" 兜底): 拿不到
-           匹配 cap 直接返回 None, 调用方应标 ep_fail 重试
+        1. 严格 seq 过滤 (防拿到上次切集残留 cap)
+        2. 无 fallback (拿不到直接返回 None)
+        3. **target_bind_ts 时间最近邻匹配** (核心防串集):
+           ViewPager 切集时 center + preload ±1 都可能 setVideoModel → CAP,
+           全都 seq 相同. 改为选 ts 最接近 target_bind_ts 的 cap (center 和 bind
+           几乎同时 fire, preload 会稍晚, 能可靠区分 center vs preload).
 
-        expected_vid 参数保留但**不做严格对比**: BIND.vid 来自 SaasVideoData.getVid()
-        (业务 ID, 形如 `76258...`), CAP.vid 来自 VideoModel.getVideoRefStr(202)
-        (TT 内部 tt_vid, 形如 `v02ebeg...`), 两套 ID 体系永远不相等. Capture.vid
-        记录下来仅用于日志/审计.
+        BIND 和 CAP 是不同管线 (SaasVideoData vs VideoModel), vid 体系不同, 无法直接
+        对比. 时间接近是目前最可靠的 center-matching 方式.
         """
         exclude_kids = exclude_kids or set()
         deadline = time.time() + timeout
         while time.time() < deadline:
             with self.lock:
-                for c in self.cap_queue:  # 顺序(首个优先)
+                # 收集所有符合 seq + kid 过滤的候选
+                candidates = []
+                for c in self.cap_queue:
                     if c.switch_seq < min_seq:
                         continue
-                    # exclude_kids 可能混 full 32 字符 kid (session-local) 和
-                    # 8 字符 prefix (manifest committed kid). 双匹配.
                     if c.kid in exclude_kids or c.kid[:8] in exclude_kids:
                         continue
-                    return c
+                    candidates.append(c)
+                if candidates:
+                    if target_bind_ts is not None:
+                        # 按 ts 最接近 target_bind_ts 排序
+                        best = min(candidates,
+                                    key=lambda c: abs(c.ts - target_bind_ts))
+                        return best
+                    # 没传 bind_ts, 首个优先 (向后兼容)
+                    return candidates[0]
             time.sleep(0.05)
         return None
 
@@ -2059,9 +2067,12 @@ def _download_main(args) -> int:
                     if reuse:
                         tgt_bind = max(reuse, key=lambda b: b.ts)
 
-                cap = state.wait_cap_for_seq(target_seq, expected_vid=None,
-                                              timeout=10.0,
-                                              exclude_kids=used_kids)
+                # 传 target_bind_ts 让 wait_cap 按时间最近邻匹配
+                # (避免拿到 preload 的 cap 造成串集)
+                cap = state.wait_cap_for_seq(
+                    target_seq, expected_vid=None,
+                    timeout=10.0, exclude_kids=used_kids,
+                    target_bind_ts=(tgt_bind.ts if tgt_bind else None))
                 pr = None
                 if tgt_bind and cap:
                     pr = PlayRecord(
