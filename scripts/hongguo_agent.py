@@ -744,43 +744,18 @@ def navigate_to_short_series(drama_dir: Path, max_retries: int = 3,
             logger.info(f"[nav] in ShortSeries after splash: {fg}")
             return True
 
-        # Strategy 1: dump 找"全屏观看"
-        ui_path = drama_dir / ".ui.xml"
-        if uiautomator_dump(ui_path, retries=2, cfg=cfg):
-            bounds = find_text_bounds(ui_path, "全屏观看")
-            if bounds:
-                logger.info(f"[nav] tap 全屏观看 @ {bounds}")
-                adb_tap(*bounds)
-                time.sleep(cfg.post_tap_wait)
-                if 'ShortSeries' in adb_foreground():
-                    return True
-
-            # Strategy 2: tap "剧场" tab 再找"继续播放"
-            c = find_text_bounds(ui_path, "剧场")
-            if c:
-                logger.info(f"[nav] tap 剧场 tab @ {c}")
-                adb_tap(*c)
-                time.sleep(cfg.post_tap_wait * 0.75)
-                if uiautomator_dump(ui_path, retries=2, cfg=cfg):
-                    cp = find_text_bounds(ui_path, "继续播放")
-                    if cp:
-                        logger.info(f"[nav] tap 继续播放 @ {cp}")
-                        adb_tap(*cp)
-                        time.sleep(cfg.post_tap_wait)
-                        if 'ShortSeries' in adb_foreground():
-                            return True
-
-        # Strategy 3: fallback 硬编码 (多组依次试)
-        # 3a: 全屏观看 单点
+        # uiautomator dump 被完全移除 — 它累积 AccessibilityService 泄漏会卡死整机.
+        # 改用两组硬编码 tap (红果 UI 目前稳定, 这是已知 tradeoff).
+        # 3a: 全屏观看 单点 (首页默认位置)
         x, y = cfg.fullscreen_watch_tap
-        logger.info(f"[nav] fallback 3a: tap 全屏观看 ({x}, {y})")
+        logger.info(f"[nav] tap 全屏观看 ({x}, {y})")
         adb_tap(x, y)
         time.sleep(cfg.post_tap_wait)
         if 'ShortSeries' in adb_foreground():
             return True
 
-        # 3b: 剧场 tab (334, 1845) + 继续播放 (824, 702) 硬编码 (Bug fix: B5)
-        logger.info("[nav] fallback 3b: 剧场+继续播放 硬编码")
+        # 3b: 剧场 tab (334, 1845) + 继续播放 (824, 702) 硬编码
+        logger.info("[nav] fallback: 剧场+继续播放 硬编码")
         adb_tap(334, 1845)
         time.sleep(cfg.post_tap_wait * 0.75)
         adb_tap(824, 702)
@@ -990,12 +965,23 @@ def run_fsm(ctx: 'AgentContext') -> int:
             # v5 侧负责 skip 已 committed 的 ep (防 manifest 有缺口时重下), 并在
             # 下够 batch_size 个新 ep 后 break. Agent 只需传 end=total.
             committed = read_committed_eps(ctx.drama_dir)
+            # exclude abandoned_eps: L1 耗尽的集不再尝试, 否则 Agent 死循环
             missing = [ep for ep in range(1, (ctx.total or 0) + 1)
-                       if ep not in committed]
+                       if ep not in committed and ep not in ctx.cb.abandoned_eps]
+            if not missing:
+                # 所有 missing 都 abandoned 或 全下完 → 跳 VERIFYING
+                logger.info(f"[fsm] 无可下载 ep (abandoned={len(ctx.cb.abandoned_eps)}), "
+                            f"进 VERIFYING")
+                ctx.state = State.VERIFYING
+                continue
             next_batch = missing[:ctx.rc.batch_size_per_session]
             logger.info(f"[fsm] batch download missing={len(missing)} "
-                        f"next={next_batch} (batch_size={ctx.rc.batch_size_per_session})")
-            ctx.v5_proc = start_v5('attach-resume', ctx, start='auto',
+                        f"next={next_batch} (batch_size={ctx.rc.batch_size_per_session} "
+                        f"abandoned={sorted(ctx.cb.abandoned_eps)})")
+            # 显式传 start=<missing 首个>, 避免 v5 resolve_start_ep('auto') 不读
+            # Agent abandoned_eps, 从已 abandoned 的 ep 开始循环
+            ctx.v5_proc = start_v5('attach-resume', ctx,
+                                    start=str(next_batch[0]),
                                     end=(ctx.total or 0),
                                     batch_size=ctx.rc.batch_size_per_session)
             rc = _download_session(ctx)
@@ -1279,6 +1265,21 @@ def main():
     logger.remove()
     logger.add(sys.stderr, level='INFO',
                format='<green>{time:HH:mm:ss}</green> | <cyan>{level:<7}</cyan> | {message}')
+
+    # Preflight: 清理上次跑留下的 AccessibilityService 残留 (UiAutomator 泄漏)
+    # 每次 uiautomator dump 超时可能留一个僵尸 service binding, 累积到 system_server
+    # 里会拦截所有 touch event 但无处理 → 全机卡死. 主动清理可打破累积.
+    for cmd in (
+        "killall uiautomator",
+        "settings put secure enabled_accessibility_services ''",
+        "settings put secure accessibility_enabled 0",
+    ):
+        try:
+            subprocess.run(["adb", "shell", cmd], capture_output=True,
+                           timeout=4, env={**os.environ, 'MSYS_NO_PATHCONV': '1'})
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    logger.info("[preflight] accessibility cleanup done")
 
     cb = CircuitBreaker(
         max_retry_per_ep=args.max_retry_per_ep,

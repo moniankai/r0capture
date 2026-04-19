@@ -1651,7 +1651,7 @@ def _download_main(args) -> int:
     try:
         expected_total = args.total if args.total > 0 else None
         if args.series_id:
-            # 跳过搜索,直接用给定 series_id RPC 进剧
+            # 跳过搜索,直接用给定 series_id RPC 进剧 pos=0 (即 ep1)
             logger.info(f"[v5] 跳过搜索,直接进 series_id={args.series_id}")
             state.target_series_id = args.series_id
             state.target_series_name = args.name
@@ -1664,13 +1664,15 @@ def _download_main(args) -> int:
                 logger.error(f"RPC failed: {r.get('err')}")
                 emit('fatal', detail=f'nav_rpc_err:{r.get("err")}')
                 return EXIT_ANR_SUSPECTED if r.get('timeout') else EXIT_FATAL
+
             # 等 BIND 确认
             deadline = time.time() + 30
             b0 = None
             while time.time() < deadline:
                 b0 = state.wait_first_valid_bind(min_total_eps=1, timeout=1.0, min_seq=nav_seq)
                 if b0 and b0.series_id == args.series_id:
-                    logger.info(f"[nav direct] BIND ep={b0.idx} total={b0.total_eps}")
+                    logger.info(f"[nav] BIND ep={b0.idx} total={b0.total_eps} "
+                                f"seq={b0.switch_seq}")
                     break
                 b0 = None
             if not b0:
