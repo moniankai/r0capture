@@ -1971,24 +1971,32 @@ def _download_main(args) -> int:
                 # RPC 后等 ot3.z.B0 被调 → play 事件入队
                 pr = state.wait_play_for_idx(target_ep, timeout=8.0,
                                               exclude_kids=used_kids)
-                # Fallback: RPC no-op (App 判定已在目标 pos 不触发 setVideoModel)
-                # → swipe 强制 ViewPager 滚动到相邻集 (必然触发 B0) → 再 RPC 切回 target
+                # Fallback: RPC no-op (App ViewPager prefetch 命中, 不 fire setVideoModel).
+                # 双段 RPC: 先切远距离 pos (必然离开 prefetch range, 触发 B0),
+                # 再切回 target (新 pos 差 > 1, App 必须新建 VideoModel).
                 if not pr:
-                    logger.warning(f"[ep{target_ep}] RPC 后无 play, swipe fallback")
-                    try:
-                        subprocess.run(
-                            ['adb', 'shell', 'input swipe 540 1400 540 400 300'],
-                            capture_output=True, timeout=3,
-                            env={**os.environ, 'MSYS_NO_PATHCONV': '1'})
-                    except (subprocess.TimeoutExpired, OSError):
-                        pass
-                    time.sleep(1.5)
-                    # 再 RPC 切回 target
+                    # 选一个和 target 相差 ≥20 的远 pos; total 不足时用另一端
+                    total = state.total_eps or (args.total or 88)
+                    if target_ep > 25:
+                        far_pos = 0                    # target 在后半段, 远 pos 切头
+                    elif target_ep < total - 25:
+                        far_pos = total - 1            # target 在前半段, 远 pos 切尾
+                    else:
+                        far_pos = 0
+                    logger.warning(f"[ep{target_ep}] RPC no-op, 双段 RPC: "
+                                   f"先 pos={far_pos} 再切回 pos={pos}")
+                    # 段 1: 切远 pos, 激活 B0 + 离开 prefetch
+                    far_seq = state.next_switch_seq()
+                    r1 = rpc_switch(script, state.target_series_id, None, far_pos,
+                                     far_seq, timeout=15.0)
+                    if r1.get('ok'):
+                        time.sleep(2.0)  # 等 App rebind + B0 fire (触发 lazy hook)
+                    # 段 2: 切回 target
                     retry_seq = state.next_switch_seq()
                     r2 = rpc_switch(script, state.target_series_id, None, pos,
                                      retry_seq, timeout=15.0)
                     if r2.get('ok'):
-                        pr = state.wait_play_for_idx(target_ep, timeout=8.0,
+                        pr = state.wait_play_for_idx(target_ep, timeout=10.0,
                                                       exclude_kids=used_kids)
             if not pr:
                 logger.warning(f"[ep{target_ep}] play_timeout "
