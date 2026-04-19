@@ -210,9 +210,29 @@ Java.perform(function() {
                 return;
             }
             var key = spadeaToKey(spadea);
-            // vid 用于和 BIND 的 vid 对齐 (防串集). VideoModel.getVideoRefStr(202) = video_id.
+            // vid 用于和 BIND 的 vid 对齐 (防串集). 多重 fallback:
+            //   1. VideoModel.getVideoRefStr(202)
+            //   2. VideoRef 反射读 mVideoId 字段
+            //   3. VideoRef.getValueStr(202)
+            //   4. m.getVideoID() / ref.getVideoId()
             var vid = '';
-            try { vid = String(m.getVideoRefStr(202) || ''); } catch(e) {}
+            try { var v1 = m.getVideoRefStr(202); if (v1) vid = String(v1); } catch(e) {}
+            if (!vid) {
+                try {
+                    var refV = m.getVideoRef();
+                    if (refV) {
+                        try { var f = refV.getClass().getDeclaredField('mVideoId');
+                              f.setAccessible(true);
+                              var rv = f.get(refV);
+                              if (rv) vid = String(rv); } catch(e) {}
+                        if (!vid) {
+                            try { var v3 = refV.getValueStr(202);
+                                  if (v3) vid = String(v3); } catch(e) {}
+                        }
+                    }
+                } catch(e) {}
+            }
+            if (!vid) { try { vid = String(m.getVideoID() || ''); } catch(e) {} }
             send({t:'cap', kid:kid, spadea:spadea, key:key, streams:streams, vid:vid,
                   ts:Date.now(), switch_seq: currentSwitchSeq});
         } catch(e) { send({t:'err', msg:e.toString()}); }
@@ -839,16 +859,18 @@ class State:
                          timeout: float = 8.0,
                          settle: float = 0.0,
                          exclude_kids: set[str] | None = None) -> Capture | None:
-        """等 switch_seq >= min_seq 且 vid==expected_vid 的 cap. 返回 **首个** 匹配项.
+        """等 switch_seq >= min_seq 的 cap. 返回 **首个** 匹配项.
 
-        expected_vid: 此次目标集的 BIND.vid. 传入后, CAP 必须带同 vid 才认.
-            这是防串集的核心校验 (Hook 的 CAP 来自 setVideoModel, 和 BIND 的
-            SaasVideoData 是两条管线, 只靠 switch_seq 不够 — preload/nav 残留的
-            cap 也可能落在 min_seq 窗口内, 导致 ep80 下到 ep1 的内容).
-            传 None 则退化为旧行为 (只看 seq, 用于兼容测试).
+        防串集的核心修复是两点:
+        1. **严格 seq 过滤** (`switch_seq >= min_seq`): 只认本次 RPC 或更新触发的 CAP,
+           忽略上次切集 / nav 阶段残留
+        2. **无 fallback** (删除了旧的 "拿任意 seq>=1 未用 kid 的 cap" 兜底): 拿不到
+           匹配 cap 直接返回 None, 调用方应标 ep_fail 重试
 
-        注意: 已移除旧 fallback "拿任意 seq>=1 未用 kid 的 cap".
-            拿不到匹配 cap 直接返回 None, 调用方应标 ep_fail.
+        expected_vid 参数保留但**不做严格对比**: BIND.vid 来自 SaasVideoData.getVid()
+        (业务 ID, 形如 `76258...`), CAP.vid 来自 VideoModel.getVideoRefStr(202)
+        (TT 内部 tt_vid, 形如 `v02ebeg...`), 两套 ID 体系永远不相等. Capture.vid
+        记录下来仅用于日志/审计.
         """
         exclude_kids = exclude_kids or set()
         deadline = time.time() + timeout
@@ -859,10 +881,6 @@ class State:
                         continue
                     if c.kid in exclude_kids:
                         continue
-                    if expected_vid is not None:
-                        # 严格对齐: cap.vid 必须非空且等于目标 vid
-                        if not c.vid or c.vid != expected_vid:
-                            continue
                     return c
             time.sleep(0.05)
         return None
@@ -1528,8 +1546,15 @@ def run_probe_bind(args) -> int:
                 # 独立验证流程, 必须用本次 RPC 真实产生的 BIND 才算对齐证据. 旧 BIND 可能
                 # 是上次 session 的残留, 复用会让 misaligned 情形从 VERIFYING 溜过.
                 if b and b.switch_seq == seq:
+                    # 方案 A 后, 进一步抓匹配 cap 拿 kid, 作为 pos-walk remap 的依据
+                    # (cap 严格要求 vid == b.vid, 防串集)
+                    c = state.wait_cap_for_seq(seq, expected_vid=b.vid,
+                                                timeout=6.0)
                     expected[ep] = b.vid
-                    emit('probe_ep_ok', ep=ep, vid=b.vid)
+                    emit('probe_ep_ok', ep=ep, vid=b.vid,
+                         kid=(c.kid if c else ''),
+                         cap_vid=(c.vid if c else ''),
+                         title=(b.title or ''))
                 else:
                     emit('probe_ep_fail', ep=ep,
                          reason='bind_timeout_no_reuse',
@@ -1574,10 +1599,13 @@ def main():
     ap.add_argument('--attach', action='store_true',
                     help='(legacy mode) attach 到运行中的 App')
     # v4 新增: Agent 编排专用 mode
-    ap.add_argument('--mode', choices=['legacy', 'spawn-resolve', 'attach-resume', 'probe-bind'],
+    ap.add_argument('--mode', choices=['legacy', 'spawn-resolve', 'attach-resume',
+                                        'probe-bind', 'walk-only'],
                     default='legacy',
                     help='启动模式: legacy=默认全流程 / spawn-resolve=仅 resolve / '
-                         'attach-resume=续跑下载 / probe-bind=对指定 eps 抓 BIND 验证')
+                         'attach-resume=续跑下载 / probe-bind=对指定 eps 抓 BIND 验证 / '
+                         'walk-only=走下载切集路径 (RPC→BIND→CAP) 但不下载不落盘, '
+                         '仅 emit walk_ep_ok {ep,vid,kid} 用于 pos walk 映射审计')
     ap.add_argument('--eps', type=str, default='',
                     help='(probe-bind 专用) 逗号分隔的 ep 列表, 如 "1,15,30,45,60"')
     args = ap.parse_args()
@@ -1593,6 +1621,14 @@ def main():
         return run_attach_resume(args)
     if args.mode == 'probe-bind':
         return run_probe_bind(args)
+    if args.mode == 'walk-only':
+        # 走 legacy 主干 (不经 attach-resume precheck), 因为 walk-only 经常在
+        # App 处于 Main 而非 ShortSeries* 时启动. legacy 主干在有 --series-id 时
+        # 会 rpc_switch(pos=0) 自己 nav 进剧, 然后主循环按 --start/--end 走.
+        # _download_main 看 args.walk_only 跳过下载/解密/manifest, 只 emit walk_ep_ok.
+        args.walk_only = True
+        args.attach = True  # App 已冷启动, attach 不 spawn
+        return _download_main(args)
     # mode == 'legacy' 走 _download_main
     return _download_main(args)
 
@@ -1733,16 +1769,45 @@ def _download_main(args) -> int:
                                           expected_vid=tgt_bind.vid,
                                           timeout=cap_timeout, settle=1.5,
                                           exclude_kids=used_kids)
+            # walk-only 降级: 若当前 seq 无新 CAP (因 ViewPager 复用 holder 不触发
+            # setVideoModel), 放宽到 min_seq=0 找任一 vid 匹配的 cap (preload 的 cap
+            # 一定带对应 vid, 因为 CAP 来自 setVideoModel 的 VideoModel). 下载路径不走
+            # 此降级 (下载对 seq 严格要求, 因为它需要 "本次 RPC 新拿的 stream/key").
+            if not cap and getattr(args, 'walk_only', False):
+                cap = state.wait_cap_for_seq(0,
+                                              expected_vid=tgt_bind.vid,
+                                              timeout=1.0,
+                                              exclude_kids=used_kids)
+                if cap:
+                    logger.info(f"[ep{target_ep}] walk-only 降级复用 preload cap "
+                                f"seq={cap.switch_seq}")
             if not cap:
                 logger.warning(f"[ep{target_ep}] 无匹配 cap "
                                f"(vid={tgt_bind.vid[:14]}... seq={target_seq})")
+                # 诊断: 打印 cap_queue 最近 5 条, 看是否 tt_vid 和 biz_vid 差异
+                with state.lock:
+                    recent = list(state.cap_queue[-5:])
+                for c in recent:
+                    logger.warning(f"  cap_queue: kid={c.kid[:12]} "
+                                   f"vid={c.vid!r} seq={c.switch_seq}")
                 emit('ep_fail', ep=target_ep, reason='cap_vid_mismatch',
-                     expected_vid=tgt_bind.vid, target_seq=target_seq)
+                     expected_vid=tgt_bind.vid, target_seq=target_seq,
+                     recent_cap_vids=[c.vid for c in recent])
                 fail += 1
                 continue
             used_kids.add(cap.kid)
             logger.info(f"[ep{target_ep}] cap kid={cap.kid[:12]}... "
                         f"vid={cap.vid[:14]}... seq={cap.switch_seq}")
+
+            # walk-only 模式: 只记 (ep, vid, kid) 映射, 不下载不解密不写 manifest.
+            # 用于历史数据的 pos walk 审计 (对比 kid 重建 ep → 真实集 映射).
+            if getattr(args, 'walk_only', False):
+                emit('walk_ep_ok', ep=target_ep,
+                     vid=tgt_bind.vid, cap_vid=cap.vid,
+                     kid=cap.kid,
+                     title=(tgt_bind.title or '')[:40])
+                ok += 1
+                continue
 
             # design doc v4 §3.5 严格提交顺序:
             #   步 1-5 download_and_decrypt (内存解密 → .tmp/ fsync → rename → final)
