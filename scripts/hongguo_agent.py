@@ -76,6 +76,10 @@ class RuntimeConfig:
     download_stall_timeout: float = 60.0   # DOWNLOADING 45s+ 无事件视为 hang
     verify_stall_timeout: float = 90.0     # VERIFYING 无事件超时
 
+    # 小批次策略 (绕 v5 Frida 主线程累积 ANR, 见 memory pitfalls 坑 12)
+    # 每 v5 session 下 N 集后主动 exit, Agent 重建 session 避免 ANR
+    batch_size_per_session: int = 3
+
     # 坐标 fallback (App 布局变化时可覆盖)
     fullscreen_watch_tap: tuple[int, int] = (570, 1281)
 
@@ -204,6 +208,9 @@ class CircuitBreaker:
     def note_restart(self) -> None:
         self.restart_count += 1
         self.consec_fail = 0  # 重启后重置连续失败
+        # Bug fix B7: recover 后重置 last_progress_ts, 否则 stall 判定立即触发
+        # (上次进展时间可能已是 10+ min 前, 新 v5 刚启动就被判 stall)
+        self.last_progress_ts = time.time()
 
 
 # =============== ADB helpers ===============
@@ -519,53 +526,68 @@ def start_v5(mode: str, ctx: 'AgentContext', **extra_args) -> subprocess.Popen:
 
 def read_events(proc: subprocess.Popen,
                  on_event: callable,
-                 stall_timeout: float = 60.0) -> int:
+                 stall_timeout: float = 60.0,
+                 tick_callback: callable = None,
+                 tick_interval: float = 5.0) -> int:
     """逐行读 v5 stdout, JSON 行调 on_event(dict), 非 JSON 行忽略.
-    阻塞到 proc 退出. 返回 exit code.
+    阻塞到 proc 退出, 或 stall 超时, 或 tick_callback 返回 True.
+    返回 exit code (-1 = stall; -2 = tick aborted).
 
-    stall_timeout: 连续无任何 stdout 输出超时 (秒). 超时返回 -1 (Agent 视为 hang).
+    Bug fix (post Codex 三轮):
+    - stall_timeout 现在按 **ep_start / ep_ok / ep_fail / probe_ep_*** 事件间隔计,
+      loguru 日志行不再让 stall 计时 reset (避免 v5 卡住时 stall 永不触发).
+    - tick_callback 每 tick_interval 秒调用一次, 让 FSM 主循环能在 subprocess
+      不退出时检查 time/stall 熔断. 返回 True 则提前 kill 并返回 -2.
     """
-    last_output_ts = time.time()
+    last_ep_event_ts = time.time()
+    # 只有这些事件类型算"有进展", 用于 stall 判定
+    PROGRESS_EVENTS = {'ep_ok', 'ep_fail', 'probe_ep_ok', 'probe_ep_fail', 'resolved'}
 
     def _reader():
-        nonlocal last_output_ts
+        nonlocal last_ep_event_ts
         try:
             for line in iter(proc.stdout.readline, ''):
                 if not line:
                     break
-                last_output_ts = time.time()
                 line = line.rstrip()
                 if not line:
                     continue
-                # JSON 事件: 首字符 '{'
                 if line.startswith('{'):
                     try:
                         ev = json.loads(line)
+                        if ev.get('type') in PROGRESS_EVENTS:
+                            last_ep_event_ts = time.time()
                         on_event(ev)
                         continue
                     except json.JSONDecodeError:
-                        # Codex M2: JSON 截断不再静默吞掉, emit 显式控制面损坏事件
                         on_event({
                             'type': 'control_plane_corrupt',
                             'reason': 'json_parse_error',
                             'snippet': line[:120],
                         })
                         continue
-                # 非 JSON 行 (v5 loguru 日志) → 转 debug
-                # 不发给 on_event, 避免污染事件流
+                # 非 JSON 行 (v5 loguru 日志) → 忽略, 不 reset stall 计时
         except (OSError, ValueError):
             pass
 
     reader_t = threading.Thread(target=_reader, daemon=True, name='v5-stdout-reader')
     reader_t.start()
 
-    # 主线程监控退出 + stall
+    # 主线程 poll: proc.poll() / stall / tick_callback
+    next_tick = time.time() + tick_interval
     while proc.poll() is None:
         time.sleep(0.5)
-        if time.time() - last_output_ts > stall_timeout:
-            logger.warning(f"[v5] stdout stall {stall_timeout}s, treat as hang")
+        now = time.time()
+        # Stall 检测: 按 ep_* 事件间隔
+        if now - last_ep_event_ts > stall_timeout:
+            logger.warning(f"[v5] ep-event stall {stall_timeout}s, kill subprocess")
             return -1
-    # 等 reader 把剩余输出读完
+        # Tick callback: 让 FSM 主循环检查全局熔断 (time/restart 等)
+        if tick_callback is not None and now >= next_tick:
+            next_tick = now + tick_interval
+            if tick_callback():
+                logger.warning("[v5] tick_callback abort requested")
+                return -2
     reader_t.join(timeout=2.0)
     return proc.returncode
 
@@ -739,10 +761,20 @@ def navigate_to_short_series(drama_dir: Path, max_retries: int = 3,
                         if 'ShortSeries' in adb_foreground():
                             return True
 
-        # Strategy 3: fallback 硬编码坐标
+        # Strategy 3: fallback 硬编码 (多组依次试)
+        # 3a: 全屏观看 单点
         x, y = cfg.fullscreen_watch_tap
-        logger.info(f"[nav] fallback tap ({x}, {y})")
+        logger.info(f"[nav] fallback 3a: tap 全屏观看 ({x}, {y})")
         adb_tap(x, y)
+        time.sleep(cfg.post_tap_wait)
+        if 'ShortSeries' in adb_foreground():
+            return True
+
+        # 3b: 剧场 tab (334, 1845) + 继续播放 (824, 702) 硬编码 (Bug fix: B5)
+        logger.info("[nav] fallback 3b: 剧场+继续播放 硬编码")
+        adb_tap(334, 1845)
+        time.sleep(cfg.post_tap_wait * 0.75)
+        adb_tap(824, 702)
         time.sleep(cfg.post_tap_wait)
         if 'ShortSeries' in adb_foreground():
             return True
@@ -944,7 +976,14 @@ def run_fsm(ctx: 'AgentContext') -> int:
             # 前置保证 (main argparse required=True): ctx.series_id 一定已设
             assert ctx.series_id, "series_id must be set before FSM enters DOWNLOADING"
 
-            ctx.v5_proc = start_v5('attach-resume', ctx, start='auto')
+            # Bug fix: 小批次策略 绕 v5 Frida 主线程累积 ANR
+            # 每 session 下 batch_size 集后主动 exit, Agent 重建 session
+            committed = read_committed_eps(ctx.drama_dir)
+            last_ok = max(committed.keys()) if committed else 0
+            batch_end = min(ctx.total or 999, last_ok + ctx.rc.batch_size_per_session)
+            logger.info(f"[fsm] batch download last_ok={last_ok} → {batch_end} "
+                        f"(batch_size={ctx.rc.batch_size_per_session})")
+            ctx.v5_proc = start_v5('attach-resume', ctx, start='auto', end=batch_end)
             rc = _download_session(ctx)
             ctx.v5_proc = None
 
@@ -955,8 +994,25 @@ def run_fsm(ctx: 'AgentContext') -> int:
                 break
 
             if rc == V5_EXIT_OK:
-                # 全部已下 / 无失败
-                ctx.state = State.VERIFYING
+                # v5 当前 batch 全部 ok; 但 total 可能还有 missing (batch_size 限制)
+                # Bug fix (B6): 只有整剧全 committed 或剩余都 abandoned 才进 VERIFYING
+                committed = read_committed_eps(ctx.drama_dir)
+                if ctx.total:
+                    still_missing = [ep for ep in range(1, ctx.total + 1)
+                                     if ep not in committed]
+                    if not still_missing:
+                        ctx.state = State.VERIFYING
+                    elif set(still_missing).issubset(ctx.cb.abandoned_eps):
+                        logger.warning(f"[fsm] 剩余 missing 全 abandoned → VERIFYING")
+                        ctx.state = State.VERIFYING
+                    else:
+                        # 还有未 abandoned 的 missing → 下一批
+                        logger.info(f"[fsm] batch ok, still {len(still_missing)} "
+                                    f"missing → next batch")
+                        continue
+                else:
+                    # 不知 total 时保守: 进 VERIFYING (由 probe 决定)
+                    ctx.state = State.VERIFYING
             elif rc == V5_EXIT_PARTIAL:
                 # 检查是否所有 missing 集都已 abandoned (L1 放弃) → 不再 retry, 进 VERIFYING
                 committed = read_committed_eps(ctx.drama_dir)
@@ -986,6 +1042,21 @@ def run_fsm(ctx: 'AgentContext') -> int:
                 ctx.state = State.NAVIGATING
             elif rc == V5_EXIT_ANR or rc == -1:
                 logger.warning(f"[fsm] v5 rc={rc} → RECOVERING")
+                # 需要先 kill subprocess (stall 情况 v5 自身没 exit)
+                if ctx.v5_proc and ctx.v5_proc.poll() is None:
+                    safe_kill_subprocess_tree(ctx.v5_proc, timeout=3.0)
+                    ctx.v5_proc = None
+                ctx.state = State.RECOVERING
+            elif rc == -2:
+                # tick_callback 主动 abort (time/stall 熔断, Bug fix)
+                logger.warning(f"[fsm] tick aborted (time/stall), kill subprocess")
+                if ctx.v5_proc and ctx.v5_proc.poll() is None:
+                    safe_kill_subprocess_tree(ctx.v5_proc, timeout=3.0)
+                    ctx.v5_proc = None
+                if ctx.cb.time_exceeded():
+                    ctx.state = State.ABORTED
+                    break
+                # 进度停滞, 转 RECOVERING
                 ctx.state = State.RECOVERING
             elif rc == V5_EXIT_FATAL:
                 logger.error(f"[fsm] v5 rc={rc} (fatal) → ABORTED")
@@ -1092,7 +1163,19 @@ def _download_session(ctx: 'AgentContext') -> int:
                          f"{ev.get('snippet', '')[:80]}")
             ctx.control_plane_corrupt_count += 1
 
-    return read_events(ctx.v5_proc, on_event, stall_timeout=ctx.rc.download_stall_timeout)
+    # Bug fix: tick 回调检查全局熔断, 避免 v5 卡住时 Agent 主循环被阻塞
+    def tick():
+        if ctx.cb.time_exceeded():
+            logger.warning(f"[tick] time exceeded {ctx.cb.max_total_seconds}s")
+            return True
+        if ctx.cb.stalled():
+            logger.warning(f"[tick] progress stalled > {ctx.cb.max_stall_seconds}s")
+            return True
+        return False
+
+    return read_events(ctx.v5_proc, on_event,
+                       stall_timeout=ctx.rc.download_stall_timeout,
+                       tick_callback=tick, tick_interval=5.0)
 
 
 def _finalize(ctx: 'AgentContext') -> int:
@@ -1174,6 +1257,9 @@ def main():
                     help='VERIFYING subprocess 无事件超时')
     ap.add_argument('--fullscreen-tap', type=str, default='570,1281',
                     help='全屏观看按钮 fallback 坐标 "x,y"')
+    ap.add_argument('--batch-size', type=int, default=3,
+                    help='每 v5 session 下载 N 集后主动 exit, Agent 重建 session '
+                         '绕 Frida 主线程累积 ANR. 默认 3.')
     args = ap.parse_args()
 
     logger.remove()
@@ -1207,6 +1293,7 @@ def main():
         download_stall_timeout=args.download_stall,
         verify_stall_timeout=args.verify_stall,
         fullscreen_watch_tap=(fx, fy),
+        batch_size_per_session=args.batch_size,
     )
 
     ctx = AgentContext(

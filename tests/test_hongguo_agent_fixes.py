@@ -334,15 +334,23 @@ class TestM1V5ExitCodesExplicit:
     """Codex M1: v5 __main__ 不能把非 int 返回值兜底成 0."""
 
     def test_explicit_exit_codes_are_passed_through(self, tmp_path: Path, monkeypatch):
-        """运行 v5 --mode attach-resume (无 adb), 期待 exit 5 (no_app) 而非 0."""
+        """运行 v5 --mode attach-resume (无 adb App), 期待 exit 5 (no_app) 而非 0.
+        测试前置: 需要 com.phoenix.read 未运行. 若正在跑则 skip.
+        """
         import subprocess
+        import os as real_os
+        env = {**real_os.environ, "MSYS_NO_PATHCONV": "1"}
+        # 前置检查: App 必须未运行
+        r = subprocess.run(['adb', 'shell', 'pidof', 'com.phoenix.read'],
+                           capture_output=True, text=True, env=env, timeout=5)
+        if (r.stdout or '').strip():
+            pytest.skip("com.phoenix.read running; test needs App stopped")
+
         v5 = Path(__file__).parent.parent / 'scripts' / 'hongguo_v5.py'
-        env = {**__import__('os').environ, "MSYS_NO_PATHCONV": "1"}
         r = subprocess.run(
             [sys.executable, str(v5), '--mode', 'attach-resume',
              '-n', 'nonexistent', '--series-id', 'x', '--out', str(tmp_path)],
             capture_output=True, text=True, timeout=30, env=env,
         )
-        # 没有 App 运行, precheck no_app → exit 5
         assert r.returncode == 5, \
             f"expected 5 (EXIT_PRECOND_FAIL), got {r.returncode}\nstdout: {r.stdout[:400]}\nstderr: {r.stderr[:400]}"
