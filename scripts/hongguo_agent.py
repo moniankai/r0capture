@@ -575,7 +575,13 @@ def read_events(proc: subprocess.Popen,
                             'snippet': line[:120],
                         })
                         continue
-                # 非 JSON 行 (v5 loguru 日志) → 忽略, 不 reset stall 计时
+                # 非 JSON 行 (v5 loguru 日志) → 打到 Agent logger 便于排查 hook 问题
+                # 不 reset stall 计时 (stall 只看 PROGRESS_EVENTS)
+                # 过滤 ANSI 颜色码 + 简化前缀
+                import re as _re
+                clean = _re.sub(r'\x1b\[[0-9;]*m', '', line)
+                if 'Hook' in clean or 'ERROR' in clean or 'WARNING' in clean or 'CRITICAL' in clean:
+                    logger.info(f"[v5] {clean[:200]}")
         except (OSError, ValueError):
             pass
 

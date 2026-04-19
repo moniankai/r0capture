@@ -167,6 +167,8 @@ Java.perform(function() {
 
     var TTE = Java.use('com.ss.ttvideoengine.TTVideoEngine');
     function handleModel(m) {
+        // Lazy hook ot3.z.B0: setVideoModel 被调时 ot3.z 一定已加载 (B0 是 caller)
+        _hookOt3ZB0Once();
         if (!m) return;
         try {
             var ref = m.getVideoRef();
@@ -240,6 +242,116 @@ Java.perform(function() {
     TTE.setVideoModel.overloads.forEach(function(ov){
         ov.implementation = function(mm) { handleModel(mm); return ov.call(this, mm); };
     });
+
+    // ===== 强绑定 Hook: ot3.z.B0 (VideoModel + SaasVideoData 同一调用) =====
+    // 调研发现 ot3.z.B0(VideoModel, _, _, SaasVideoData, ...) 在一次调用中同时
+    // 持有 biz_vid (业务 ID 76258...) 和 tt_vid (TT 内部 v02eb...), 以及 kid/url.
+    // Hook 它能 emit 单条 play 事件, 下载时绝对不会串集 (替代旧 BIND+CAP 弱关联).
+    //
+    // ot3.z 在 App attach 时通常尚未加载 (lazy class loading). 使用 **lazy hook**
+    // 策略: 在 handleModel (TTVideoEngine.setVideoModel) 里做首次 hook, 因为
+    // setVideoModel 被调时 ot3.z.B0 一定已加载 (B0 是 setVideoModel 的 caller).
+    // 首次 setVideoModel 调用会错过 B0 的参数 (hook 时 B0 已 return), 但下一次
+    // 切集一定能抓. 主循环用 swipe+RPC fallback 兜底首集丢失.
+    var _b0_hooked = false;
+    var _b0_first_err_reported = false;
+    function _hookOt3ZB0Once() {
+        if (_b0_hooked) return;
+        try {
+            var Z = Java.use('ot3.z');
+            _b0_hooked = true;
+            Z.B0.overloads.forEach(function(ov) {
+            ov.implementation = function() {
+                var args = Array.prototype.slice.call(arguments);
+                var vm = null, svd = null;
+                for (var i = 0; i < args.length; i++) {
+                    if (args[i] === null) continue;
+                    try {
+                        var cn = String(args[i].getClass().getName());
+                        if (cn.indexOf('ttvideoengine.model.VideoModel') >= 0) vm = args[i];
+                        if (cn.indexOf('saas.video.SaasVideoData') >= 0) svd = args[i];
+                    } catch(e) {}
+                }
+                if (!vm || !svd) { return ov.apply(this, args); }
+
+                // 提取 SaasVideoData (biz 层)
+                var biz_vid = '', idx = -1, title = '', seriesId = '';
+                try { biz_vid = String(svd.getVid()); } catch(e) {}
+                try { idx = Number(svd.getVidIndex()); } catch(e) {}
+                try { title = String(svd.getTitle()); } catch(e) {}
+                try { seriesId = String(svd.getSeriesId()); } catch(e) {}
+
+                // 提取 VideoModel (tt 层, 走 handleModel 同款逻辑)
+                var tt_vid = '', kid = '', spadea = '', streams = [];
+                try {
+                    var ref = vm.getVideoRef();
+                    if (ref) {
+                        try {
+                            var f0 = ref.getClass().getDeclaredField('mVideoId');
+                            f0.setAccessible(true);
+                            tt_vid = String(f0.get(ref) || '');
+                        } catch(e) {}
+                        try {
+                            var list = ref.getVideoInfoList();
+                            if (list) {
+                                var arr = Java.cast(list, ArrayList);
+                                var n = arr.size();
+                                for (var j = 0; j < n; j++) {
+                                    var info = arr.get(j);
+                                    var icls = info.getClass();
+                                    var _fstr = function(name) {
+                                        try { var f2 = icls.getDeclaredField(name); f2.setAccessible(true);
+                                              return String(f2.get(info) || ''); } catch(e) { return ''; }
+                                    };
+                                    var _fint = function(name) {
+                                        try { var f2 = icls.getDeclaredField(name); f2.setAccessible(true);
+                                              var vv = f2.get(info); if (vv === null) return 0;
+                                              try { return vv.intValue(); } catch(e) {
+                                                  var nn = parseInt(String(vv)); return isNaN(nn) ? 0 : nn; }
+                                        } catch(e) { return 0; }
+                                    };
+                                    var ck = _fstr('mKid'), cs = _fstr('mSpadea');
+                                    if (!kid) kid = ck;
+                                    if (!spadea) spadea = cs;
+                                    streams.push({
+                                        main_url: _fstr('mMainUrl'),
+                                        backup_url: _fstr('mBackupUrl1'),
+                                        file_hash: _fstr('mFileHash'),
+                                        bitrate: _fint('mBitrate'),
+                                        vheight: _fint('mVHeight'),
+                                        vwidth: _fint('mVWidth'),
+                                    });
+                                }
+                            }
+                        } catch(e) {}
+                    }
+                } catch(e) {}
+
+                var key = (kid && spadea) ? spadeaToKey(spadea) : '';
+
+                send({t: 'play',
+                      biz_vid: biz_vid, idx: idx, title: title, series_id: seriesId,
+                      tt_vid: tt_vid, kid: kid, spadea: spadea, key: key,
+                      streams: streams,
+                      ts: Date.now(), switch_seq: currentSwitchSeq});
+
+                return ov.apply(this, args);
+            };
+        });
+        send({t: 'play_hook_ok', overloads: Z.B0.overloads.length});
+        } catch(e) {
+            // ot3.z 还未加载 (lazy classload): _b0_hooked 保持 false,
+            // 下次 handleModel 被调 (即下次 setVideoModel) 会再试.
+            _b0_hooked = false;
+            // 只首次失败时 emit, 避免 spam
+            if (!_b0_first_err_reported) {
+                _b0_first_err_reported = true;
+                send({t: 'play_hook_retry', err: String(e),
+                      note: 'deferred to first setVideoModel'});
+            }
+        }
+    }
+    // 不在 Java.perform 顶层调用 _hookOt3ZB0Once(): 改由 handleModel 懒调用
 
     // 诊断 hook: 其他 set*/play*/prepare* 方法, 日志其调用(寻找异常剧的播放路径)
     try {
@@ -617,6 +729,36 @@ class Capture:
 
 
 @dataclass
+class PlayRecord:
+    """强绑定记录 — 一次 ot3.z.B0 调用同时持 biz_vid + tt_vid + kid + url + key.
+
+    这是根治串集的核心数据结构: (biz_vid, idx) 和 (tt_vid, kid, url, key) 来自
+    同一次 Java 方法调用, 不可能错配. 下游 wait_play_for_idx 只按 idx 过滤即可.
+    """
+    biz_vid: str
+    idx: int
+    title: str
+    series_id: str
+    tt_vid: str
+    kid: str
+    spadea: str
+    key: str
+    streams: list = field(default_factory=list)
+    ts: float = 0.0
+    switch_seq: int = 0
+
+    def best_stream(self, max_short_side: int = 1080) -> dict | None:
+        pool = [s for s in self.streams if s.get('main_url')]
+        if not pool:
+            return None
+        def short(s): return min(s['vheight'], s['vwidth']) if s.get('vwidth') else s.get('vheight', 0)
+        cand = [s for s in pool if short(s) <= max_short_side]
+        if cand:
+            pool = cand
+        return max(pool, key=lambda s: s.get('bitrate', 0))
+
+
+@dataclass
 class Bind:
     idx: int
     vid: str | None
@@ -636,6 +778,9 @@ class State:
         # 队列:按到达顺序保留所有 cap/bind,按 switch_seq + idx 校验取
         self.cap_queue: list[Capture] = []
         self.bind_queue: list[Bind] = []
+        # 强绑定队列: ot3.z.B0 hook 产生的 play 事件 (biz_vid + tt_vid + kid 一次抓齐)
+        # 根治串集的主路径; 旧 cap_queue/bind_queue 作 fallback 保留.
+        self.play_queue: list[PlayRecord] = []
         # series_name 由 setSeriesName 异步回填,按 (vid → name) 缓存
         self.name_by_vid: dict[str, str] = {}
         self.target_series_id: str | None = None
@@ -718,6 +863,69 @@ class State:
                 if b.total_eps > 0:
                     self.total_eps = max(self.total_eps, b.total_eps)
         return b
+
+    def ingest_play(self, p: dict) -> PlayRecord | None:
+        """ingest 强绑定 play 事件 (来自 ot3.z.B0). 要求 biz_vid + idx + kid + spadea 齐全.
+
+        串剧防护同 ingest_bind: 若 series_id 锁定且 p.series_id 不一致且 idx>1 则抛 CrossDramaError.
+        """
+        biz_vid = p.get('biz_vid') or ''
+        idx = int(p.get('idx') or -1)
+        kid = p.get('kid') or ''
+        spadea = p.get('spadea') or ''
+        series_id = p.get('series_id') or ''
+        if not biz_vid or idx < 1 or len(kid) != 32 or not spadea:
+            return None
+        # 串剧防护 (design v4 §6)
+        if (self.target_series_id and series_id
+                and series_id != self.target_series_id and idx > 1):
+            emit('cross_drama', expected=self.target_series_id,
+                 actual=series_id, ep=idx, biz_vid=biz_vid)
+            raise CrossDramaError(
+                f"locked={self.target_series_id} but play has "
+                f"series_id={series_id} (idx={idx})"
+            )
+        pr = PlayRecord(
+            biz_vid=biz_vid, idx=idx,
+            title=p.get('title') or '',
+            series_id=series_id,
+            tt_vid=p.get('tt_vid') or '',
+            kid=kid, spadea=spadea,
+            key=p.get('key') or '',
+            streams=p.get('streams') or [],
+            ts=(p.get('ts') or 0) / 1000.0,
+            switch_seq=int(p.get('switch_seq') or 0),
+        )
+        with self.lock:
+            self.play_queue.append(pr)
+            if len(self.play_queue) > 200:
+                self.play_queue = self.play_queue[-200:]
+            if self.target_series_id and series_id == self.target_series_id:
+                if self.total_eps == 0:
+                    # 从 BIND 拿过 total_eps, play 里没这字段, 略.
+                    pass
+        return pr
+
+    def wait_play_for_idx(self, target_idx: int,
+                          timeout: float = 8.0,
+                          exclude_kids: set[str] | None = None) -> PlayRecord | None:
+        """等 idx == target_idx 的 play 事件. 支持 kid prefix 排除 (跨 session 持久化).
+
+        play 事件是"一次性强绑定" — biz_vid/tt_vid/kid/url/key/idx 来自同一次 Java
+        调用 (ot3.z.B0), 所以只看 idx 即可. 不需要 switch_seq 匹配, 不需要 vid 二次校验.
+        """
+        exclude_kids = exclude_kids or set()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self.lock:
+                for pr in self.play_queue:
+                    if pr.idx != target_idx:
+                        continue
+                    if pr.kid in exclude_kids or pr.kid[:8] in exclude_kids:
+                        continue
+                    return pr
+            time.sleep(0.05)
+        return None
 
     def ingest_name(self, p: dict):
         vid = p.get('vid')
@@ -924,7 +1132,21 @@ def setup_frida(state: State, attach_running: bool = False):
             return
         p = msg['payload']
         t = p.get('t')
-        if t == 'cap':
+        if t == 'play':
+            pr = state.ingest_play(p)
+            if pr:
+                logger.info(f"[PLAY] ep={pr.idx} biz={pr.biz_vid[:14]}... "
+                            f"tt={pr.tt_vid[:16]}... kid={pr.kid[:12]}... "
+                            f"title={pr.title[:30]}")
+        elif t == 'play_hook_ok':
+            logger.info(f"[Hook] ot3.z.B0 强绑定 hook ok "
+                        f"(overloads={p.get('overloads')} retries={p.get('retries',0)})")
+        elif t == 'play_hook_retry':
+            logger.info(f"[Hook] ot3.z.B0 重试 #{p.get('attempt')}: {p.get('err')}")
+        elif t == 'play_hook_err':
+            logger.warning(f"[Hook] ot3.z.B0 hook 失败: {p.get('err')} "
+                           f"({p.get('note', '')})")
+        elif t == 'cap':
             ok = state.ingest_cap(p)
             if ok:
                 c = state.cap_queue[-1]
@@ -1710,13 +1932,11 @@ def _download_main(args) -> int:
 
         ok = 0
         fail = 0
-        seen_ep_vids: set[tuple[int, str]] = set()  # (ep, vid) 联合去重
         # 已用过的 cap.kid — 防止同一 cap 多次下载 → 串集.
+        # 强绑定 play 路径: 每次 ot3.z.B0 emit {biz_vid, tt_vid, kid} 都唯一对应一集,
+        # used_kids 是二级保险 (kid 已用过就不再当新集的候选).
         # **跨 session 持久化**: 读 manifest 里所有 committed ep 的 kid8, 注入 used_kids.
-        # 否则: Agent 每次 recovery 新建 session, used_kids 清空; 若 preload 延迟入队
-        # 带了新 seq, 旧 ep 的 cap 会被再次挑中, 下到新 ep 变成内容重复 (实测串集模式).
-        # used_kids 里同时放 kid8 (8 字符 prefix from manifest) 和 full 32 字符 kid
-        # (session 内下载成功的 cap.kid). wait_cap_for_seq 做双匹配 (full or prefix).
+        # 旧 bind+cap 路径的串集根因之一就是 session-local used_kids 不持久.
         committed_kid_map = read_committed_eps(out_dir)
         committed_at_start = set(committed_kid_map.keys())
         used_kids: set[str] = set(committed_kid_map.values())  # 初始 = 历史 kid8 prefixes
@@ -1725,105 +1945,78 @@ def _download_main(args) -> int:
         new_downloads = 0
         batch_size = int(getattr(args, 'batch_size', 0) or 0)
 
-        # 循环: 每集分配一个 switch_seq → RPC → 等匹配 BIND → 等匹配 cap → 下载
+        # 循环: 每集 RPC → wait_play_for_idx (强绑定) → download → manifest
         for target_ep in range(start_ep, end + 1):
             if target_ep in committed_at_start:
                 continue  # 已下且文件完好, skip
-            # 首集特判: 已经通过 navigate 进入, b0 就是我们要的
-            use_b0 = (current_ep == b0.idx and target_ep == b0.idx
-                      and target_ep == start_ep)
-            if use_b0:
-                tgt_bind = b0
-                target_seq = b0.switch_seq  # 0, 意味着首集用 nav 阶段的 cap
-                logger.info(f"[ep{target_ep}] use nav b0 idx={b0.idx} "
-                            f"vid={b0.vid[:14]}... seq={target_seq}")
-            else:
-                # 实证 (probe_ep48.py 2026-04-18): pos=N 切集后,ViewPager center page
-                # 对应 vidIndex=N+1 (0-based pos vs 1-based vidIndex)。
-                # 事件顺序: CAP[center=vid N+1] → BIND[center] → BIND[right preload N+2]
-                #          → BIND[left N] → CAP[right preload=vid N+2]。
-                # 取首个 CAP = center = target,故 pos = target_ep - 1。
-                # (历史 pos=target_ep-2 靠 used_kids 过滤掉 preload 的 ep N-1,
-                #  在中途跳段时暴露 off-by-one; 见 probe summary.txt)
+
+            # 先看 play_queue 里是否已有本 ep 的事件 (nav 阶段/preload 已触发 ot3.z.B0)
+            pr = state.wait_play_for_idx(target_ep, timeout=0.1,
+                                          exclude_kids=used_kids)
+            if not pr:
+                # 需要 RPC 切集触发 ot3.z.B0 → play 事件
                 pos = target_ep - 1
                 target_seq = state.next_switch_seq()
                 logger.info(f"[ep{target_ep}] RPC switchToEp pos={pos} seq={target_seq}")
-                r = rpc_switch(script, state.target_series_id, None, pos, target_seq, timeout=15.0)
-                logger.info(f"[ep{target_ep}] rpc ok={r.get('ok')} ctx={r.get('ctx')} "
-                            f"seq={r.get('seq')} timeout={r.get('timeout')}")
+                r = rpc_switch(script, state.target_series_id, None, pos,
+                                target_seq, timeout=15.0)
+                logger.info(f"[ep{target_ep}] rpc ok={r.get('ok')} "
+                            f"ctx={r.get('ctx')} timeout={r.get('timeout')}")
                 if not r.get('ok'):
                     logger.warning(f"[ep{target_ep}] rpc err: {r.get('err')}")
+                    emit('ep_fail', ep=target_ep,
+                         reason=f'rpc_err:{r.get("err")}')
                     fail += 1
                     continue
-
-                # 等匹配 BIND(idx=target, switch_seq >= target_seq)
-                tgt_bind = state.wait_bind_for_series_seq(
-                    state.target_series_id, target_ep, target_seq, timeout=10.0)
-                if not tgt_bind:
-                    # 降级: 上一集下载时,ViewPager 已把 target_ep 作为 preload right
-                    # bind 过了 (idx=target_ep, seq=target_seq-1). Holder 缓存,本次
-                    # setCurrentItem 不再 rebind. 复用旧 BIND 仍然指向正确 biz_vid.
-                    with state.lock:
-                        reuse = [b for b in state.bind_queue
-                                 if b.series_id == state.target_series_id
-                                 and b.idx == target_ep and b.switch_seq >= 1]
-                    if reuse:
-                        tgt_bind = max(reuse, key=lambda b: b.ts)
-                        logger.info(f"[ep{target_ep}] 降级复用 preload BIND "
-                                    f"(seq={tgt_bind.switch_seq}, vid={tgt_bind.vid[:14]}...)")
-                    else:
-                        logger.warning(f"[ep{target_ep}] 切集后新 BIND 未到 (seq={target_seq})")
-                        fail += 1
-                        continue
-
-            ep_vid_key = (target_ep, tgt_bind.vid)
-            if ep_vid_key in seen_ep_vids:
-                logger.info(f"[ep{target_ep}] (ep,vid) 已下,跳过")
-                continue
-            seen_ep_vids.add(ep_vid_key)
-            current_ep = target_ep
-
-            # 等匹配 cap: 必须 vid == tgt_bind.vid (防串集), switch_seq >= target_seq
-            cap_timeout = 15.0 if use_b0 else 8.0  # ep1 nav 后首次 Activity 启动慢
-            cap = state.wait_cap_for_seq(target_seq,
-                                          expected_vid=tgt_bind.vid,
-                                          timeout=cap_timeout, settle=1.5,
-                                          exclude_kids=used_kids)
-            # walk-only 降级: 若当前 seq 无新 CAP (因 ViewPager 复用 holder 不触发
-            # setVideoModel), 放宽到 min_seq=0 找任一 vid 匹配的 cap (preload 的 cap
-            # 一定带对应 vid, 因为 CAP 来自 setVideoModel 的 VideoModel). 下载路径不走
-            # 此降级 (下载对 seq 严格要求, 因为它需要 "本次 RPC 新拿的 stream/key").
-            if not cap and getattr(args, 'walk_only', False):
-                cap = state.wait_cap_for_seq(0,
-                                              expected_vid=tgt_bind.vid,
-                                              timeout=1.0,
+                # RPC 后等 ot3.z.B0 被调 → play 事件入队
+                pr = state.wait_play_for_idx(target_ep, timeout=8.0,
                                               exclude_kids=used_kids)
-                if cap:
-                    logger.info(f"[ep{target_ep}] walk-only 降级复用 preload cap "
-                                f"seq={cap.switch_seq}")
-            if not cap:
-                logger.warning(f"[ep{target_ep}] cap_timeout "
-                               f"(bind_vid={tgt_bind.vid[:14]}... target_seq={target_seq})")
-                # reason='cap_timeout' 归类为 infra → Agent 累 consec_fail → 达阈值
-                # 就触发 recovery (force-stop App + restart frida), 以绕 ViewPager
-                # 复用 holder 导致 setVideoModel 不 fire 的 no-op 场景.
-                emit('ep_fail', ep=target_ep, reason='cap_timeout',
-                     target_seq=target_seq)
+                # Fallback: RPC no-op (App 判定已在目标 pos 不触发 setVideoModel)
+                # → swipe 强制 ViewPager 滚动到相邻集 (必然触发 B0) → 再 RPC 切回 target
+                if not pr:
+                    logger.warning(f"[ep{target_ep}] RPC 后无 play, swipe fallback")
+                    try:
+                        subprocess.run(
+                            ['adb', 'shell', 'input swipe 540 1400 540 400 300'],
+                            capture_output=True, timeout=3,
+                            env={**os.environ, 'MSYS_NO_PATHCONV': '1'})
+                    except (subprocess.TimeoutExpired, OSError):
+                        pass
+                    time.sleep(1.5)
+                    # 再 RPC 切回 target
+                    retry_seq = state.next_switch_seq()
+                    r2 = rpc_switch(script, state.target_series_id, None, pos,
+                                     retry_seq, timeout=15.0)
+                    if r2.get('ok'):
+                        pr = state.wait_play_for_idx(target_ep, timeout=8.0,
+                                                      exclude_kids=used_kids)
+            if not pr:
+                logger.warning(f"[ep{target_ep}] play_timeout "
+                               f"(ot3.z.B0 未被调用, swipe+RPC 亦失败)")
+                # play_timeout 归为 infra: Agent 会累 consec_fail → recovery
+                emit('ep_fail', ep=target_ep, reason='play_timeout')
                 fail += 1
                 continue
-            used_kids.add(cap.kid)
-            logger.info(f"[ep{target_ep}] cap kid={cap.kid[:12]}... "
-                        f"vid={cap.vid[:14]}... seq={cap.switch_seq}")
 
-            # walk-only 模式: 只记 (ep, vid, kid) 映射, 不下载不解密不写 manifest.
-            # 用于历史数据的 pos walk 审计 (对比 kid 重建 ep → 真实集 映射).
+            used_kids.add(pr.kid)
+            current_ep = pr.idx
+            logger.info(f"[ep{target_ep}] play biz={pr.biz_vid[:14]}... "
+                        f"tt={pr.tt_vid[:16]}... kid={pr.kid[:12]}... "
+                        f"title={pr.title[:30]}")
+
+            # walk-only: 只记映射 不下载
             if getattr(args, 'walk_only', False):
                 emit('walk_ep_ok', ep=target_ep,
-                     vid=tgt_bind.vid, cap_vid=cap.vid,
-                     kid=cap.kid,
-                     title=(tgt_bind.title or '')[:40])
+                     biz_vid=pr.biz_vid, tt_vid=pr.tt_vid,
+                     vid=pr.biz_vid, cap_vid=pr.tt_vid,  # 兼容旧字段名
+                     kid=pr.kid, title=pr.title[:40])
                 ok += 1
                 continue
+
+            # 构造 Capture 兼容 download_and_decrypt (后者走 cap.best_stream + cap.key)
+            cap = Capture(kid=pr.kid, spadea=pr.spadea, key=pr.key,
+                          vid=pr.tt_vid, streams=pr.streams,
+                          ts=pr.ts, switch_seq=pr.switch_seq)
 
             # design doc v4 §3.5 严格提交顺序:
             #   步 1-5 download_and_decrypt (内存解密 → .tmp/ fsync → rename → final)
@@ -1836,9 +2029,11 @@ def _download_main(args) -> int:
                 continue
 
             rec = {
-                'ep': target_ep, 'vid': tgt_bind.vid,
+                'ep': target_ep, 'vid': pr.biz_vid,
+                'tt_vid': pr.tt_vid,
                 'kid': cap.kid, 'ts': time.time(),
                 'series_id': state.target_series_id,
+                'title': pr.title,
                 'bytes': ep_path.stat().st_size if ep_path.exists() else 0,
             }
             if not append_manifest(out_dir, rec):
@@ -1850,8 +2045,9 @@ def _download_main(args) -> int:
 
             ok += 1
             new_downloads += 1
-            emit('ep_ok', ep=target_ep, vid=tgt_bind.vid, kid=cap.kid,
-                 bytes=rec['bytes'], series_id=state.target_series_id)
+            emit('ep_ok', ep=target_ep, vid=pr.biz_vid, tt_vid=pr.tt_vid,
+                 kid=cap.kid, bytes=rec['bytes'],
+                 series_id=state.target_series_id)
 
             # batch_size 限制: 下够 N 个新 ep 后主动退出让 Agent 重建 session
             # 绕 Frida 单 session 多集累积 ANR (B4 实测发现)
