@@ -205,12 +205,20 @@ class LeanState:
         self.by_ep: dict[int, B0Event] = {}
         self.all: list[B0Event] = []
         self.latest_idx = -1
+        # 目标 series_id, 下载前强校验防串剧 (空串表示不校验, 用于 debug)
+        self.target_sid: str = ''
+        self.rejected_sids: set[str] = set()  # 被拒绝的 sid, 汇报用
 
     def ingest(self, p: dict):
         e = B0Event(p)
         if e.idx < 1:
             return
         with self.lock:
+            # 串剧保护: 非目标 sid 不入 by_ep 但仍入 all (便于调试 dump)
+            if self.target_sid and e.sid and e.sid != self.target_sid:
+                self.rejected_sids.add(e.sid)
+                self.all.append(e)
+                return
             self.by_ep[e.idx] = e
             self.all.append(e)
             self.latest_idx = e.idx
@@ -300,6 +308,10 @@ def try_download_current(state: LeanState, ep: int,
     e = state.wait_ep(ep, timeout=6.0)
     if not e:
         return False
+    # 串剧校验: 下载前 sid 必须等于目标 (防御 App 意外切剧, 推荐侧栏 ingest 等)
+    if state.target_sid and e.sid != state.target_sid:
+        logger.warning(f'ep{ep}: sid 不符 ({e.sid} != target {state.target_sid}), 拒绝下载')
+        return False
     if not e.key or len(e.key) != 32 or not e.streams:
         logger.warning(f'ep{ep}: B0 缺 key/streams '
                        f'(key_len={len(e.key or "")}, streams={len(e.streams)})')
@@ -344,20 +356,31 @@ def main():
                 f'range={args.start}..{end} 已 committed={len(committed)}')
 
     state = LeanState()
+    state.target_sid = args.series_id  # 串剧保护: 非目标 sid 的 B0 事件不入 by_ep
     session, script = attach_lean(state)
 
     try:
-        # 等初始 B0 (App 恢复进度)
-        logger.info('等初始 B0 (App 恢复进度)...')
+        # 等初始 B0 (App 恢复进度). 同时允许"被拒绝"的 sid 事件作为 spawn_nav
+        # 失败的信号 — App 不在目标剧里.
+        logger.info(f'等初始 B0 target_sid={args.series_id}...')
         deadline = time.time() + 15
         while time.time() < deadline and state.latest_idx < 1:
             time.sleep(0.5)
         if state.latest_idx < 1:
+            # 检查是否所有 B0 都被拒绝 (App 在别的剧)
+            if state.rejected_sids:
+                logger.error(f'初始 B0 全被拒绝, 当前 App 在非目标剧: {state.rejected_sids}')
+                logger.error('spawn_nav.py 失败? 请重跑 spawn_nav 或检查 App 状态')
+                return 3
             logger.warning('初始 B0 未到, swipe 触发')
             swipe_next()
             time.sleep(4)
+            # swipe 后再检查一次
+            if state.latest_idx < 1 and state.rejected_sids:
+                logger.error(f'swipe 后仍全被拒绝: {state.rejected_sids}')
+                return 3
 
-        logger.info(f'初始 ep = {state.latest_idx}')
+        logger.info(f'初始 ep = {state.latest_idx} (rejected_sids={state.rejected_sids or "none"})')
 
         # 扫描式下载: swipe 过冲严重, 所以不强制精确 target,
         # 每次 swipe 后看当前 ep 是否 pending, 是就下载.
