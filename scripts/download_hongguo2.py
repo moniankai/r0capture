@@ -409,23 +409,21 @@ def navigate_to_drama_v2(drama_name: str, timeout: float = 25.0) -> bool:
     subprocess.run(["adb", "shell", "input", "keyevent", "KEYCODE_HOME"],
                    capture_output=True, check=False, env=env)
     time.sleep(1.5)
+    # 必须加 -p <包名> 强制路由到红果,否则 MIUI 的 com.android.quicksearchbox
+    # 会劫持 dragon8662:// scheme,进入小米系统搜索而不是红果搜索
     subprocess.run(
         ["adb", "shell", "am", "start", "-a", "android.intent.action.VIEW",
-         "-d", "dragon8662://search", APP_PACKAGE],
+         "-d", "dragon8662://search", "-p", APP_PACKAGE],
         capture_output=True, check=False, env=env,
     )
     time.sleep(4.0)
 
-    # 阶段 1：尝试搜索历史直通
+    # 阶段 1: 搜索历史直通 — **已禁用**
+    # 原因(2026-04-18): 实测搜索历史里的 "text==drama_name" 节点 tap 后,
+    # App 可能跳到错误的剧(如《乡下御厨》历史条目 tap 后进了《我在宗门开饭馆》75 集剧)。
+    # 根因未明,可能是历史条目 bounds 被其他覆盖层占用,或 tap 事件路由不一致。
+    # 永远走阶段 2 输入+搜索,确保命中正确剧。
     history_tap = None
-    root = _dump_root()
-    if root is not None:
-        for n in root.iter("node"):
-            if n.get("resource-id", "").endswith("id/drv") and n.get("text", "") == drama_name:
-                b = _parse_bounds(n.get("bounds", ""))
-                if b:
-                    history_tap = ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
-                    break
     if history_tap:
         logger.info(f"[导航v2] 搜索历史命中，tap {history_tap}")
         run_adb(["shell", "input", "tap", str(history_tap[0]), str(history_tap[1])])

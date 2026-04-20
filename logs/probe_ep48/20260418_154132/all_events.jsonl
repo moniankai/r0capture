@@ -1,0 +1,83 @@
+{"t": "log", "msg": "http hooked", "_recv_ts": 1776498092.9843953}
+{"t": "ready", "_recv_ts": 1776498093.0025396}
+{"t": "args_set", "m": "setContext", "v": "com.dragon.read.component.shortvideo.imp", "switch_seq": 1, "ts": 1776498098430, "_recv_ts": 1776498098.0743494}
+{"t": "args_set", "m": "setSeriesId", "v": "7617050216549583897", "switch_seq": 1, "ts": 1776498098431, "_recv_ts": 1776498098.074716}
+{"t": "args_set", "m": "setVideoClickPos", "v": "44", "switch_seq": 1, "ts": 1776498098432, "_recv_ts": 1776498098.0749142}
+{"t": "args_set", "m": "setVideoForcePos", "v": "44", "switch_seq": 1, "ts": 1776498098432, "_recv_ts": 1776498098.0750515}
+{"t": "args_set", "m": "setClearTop", "v": "true", "switch_seq": 1, "ts": 1776498098433, "_recv_ts": 1776498098.0751817}
+{"t": "cap", "kid": "69c5344f559c7a5e6a51d5c30002ebeb", "ts": 1776498098466, "switch_seq": 1, "_recv_ts": 1776498098.1056547}
+{"t": "act_call", "cls": "ShortSeriesActivity", "m": "setIntent", "switch_seq": 1, "ts": 1776498098603, "_recv_ts": 1776498098.2418852}
+{"t": "act_call", "cls": "ShortSeriesActivity", "m": "onCreate", "switch_seq": 1, "ts": 1776498098614, "_recv_ts": 1776498098.2556443}
+{"t": "act_call", "cls": "ShortSeriesActivity", "m": "onResume", "switch_seq": 1, "ts": 1776498098661, "_recv_ts": 1776498098.3008015}
+{"t": "vp_set", "cls": "ViewPager2", "pos": 44, "switch_seq": 1, "ts": 1776498098872, "_recv_ts": 1776498098.511942}
+{"t": "bind", "vid": "7620656626357259326", "idx": 45, "series_id": "7617050216549583897", "name": "null", "total_eps": 60, "ts": 1776498099253, "switch_seq": 1, "_recv_ts": 1776498098.893201}
+{"t": "bind", "vid": "7620656626357259326", "idx": 45, "series_id": "7617050216549583897", "name": "null", "total_eps": 60, "ts": 1776498099254, "switch_seq": 1, "_recv_ts": 1776498098.8951762}
+{"t": "http", "url": "https://reading.snssdk.com/reading/bookapi/plan/v?total_chapter_num=0&extra_params=%7B%22713_video_bottom_bar_related_novel%22%3A%22%22%7D&filter_ids=7617050216549583897&offset=0&current_chapter_num=0&search_middle_page_version=0&user_is_login=0&bookstore_tab=0&bookstore_tab_type=0&book_id=7617050216549583897&scene=10&new_search_middle_page=false&hot_word_exchange=false&last_search_page_interval=0", "code": 200, "dt": 412, "switch_seq": 1, "ts": 1776498099744, "_recv_ts": 1776498099.3850813}
+{"t": "bind", "vid": "7620996517578411070", "idx": 46, "series_id": "7617050216549583897", "name": "null", "total_eps": 60, "ts": 1776498099887, "switch_seq": 1, "_recv_ts": 1776498099.5266726}
+{"t": "bind", "vid": "7620996517578411070", "idx": 46, "series_id": "7617050216549583897", "name": "null", "total_eps": 60, "ts": 1776498099888, "switch_seq": 1, "_recv_ts": 1776498099.5274699}
+{"t": "http", "url": "https://ad.zijieapi.com/api/ad/v1/recall_ads/banner/?rit=58036&xs_req_info=%7B%22short_series_id%22%3A%227617050216549583897%22%2C%22short_series_video_id%22%3A%227620656626357259326%22%2C%22short_series_entrance%22%3A0%2C%22short_series_pos%22%3A44%2C%22short_series_index%22%3A44%2C%22xs_book_id%22%3A%227617050216549583897%22%2C%22short_series_count%22%3A60%2C%22is_no_active%22%3A0%2C%22is_from_o", "code": 200, "dt": 508, "switch_seq": 1, "ts": 1776498099903, "_recv_ts": 1776498099.5431511}
+{"t": "bind", "vid": "7620655757981125694", "idx": 44, "series_id": "7617050216549583897", "name": "null", "total_eps": 60, "ts": 1776498100114, "switch_seq": 1, "_recv_ts": 1776498099.7538626}
+{"t": "bind", "vid": "7620655757981125694", "idx": 44, "series_id": "7617050216549583897", "name": "null", "total_eps": 60, "ts": 1776498100115, "switch_seq": 1, "_recv_ts": 1776498099.7541642}
+{"t": "cap", "kid": "69c33763559c7abc56a34db50003ebeb", "ts": 1776498100338, "switch_seq": 1, "_recv_ts": 1776498099.9778678}
+{"t": "http", "url": "https://reading.snssdk.com/reading/distribution/book_pack_fields/series_detail_info/v1", "code": 200, "dt": 155, "switch_seq": 1, "ts": 1776498100474, "_recv_ts": 1776498100.1137402}
+{"t": "args_set", "m": "setContext", "v": "com.dragon.read.component.shortvideo.imp", "switch_seq": 2, "ts": 1776498106507, "_recv_ts": 1776498106.146799}
+{"t": "args_set", "m": "setSeriesId", "v": "7617050216549583897", "switch_seq": 2, "ts": 1776498106507, "_recv_ts": 1776498106.1471574}
+{"t": "args_set", "m": "setVideoClickPos", "v": "45", "switch_seq": 2, "ts": 1776498106508, "_recv_ts": 1776498106.1473522}
+{"t": "args_set", "m": "setVideoForcePos", "v": "45", "switch_seq": 2, "ts": 1776498106509, "_recv_ts": 1776498106.1484854}
+{"t": "args_set", "m": "setClearTop", "v": "true", "switch_seq": 2, "ts": 1776498106509, "_recv_ts": 1776498106.148658}
+{"t": "cap", "kid": "69c33763559c7abc56a34db50003ebeb", "ts": 1776498106529, "switch_seq": 2, "_recv_ts": 1776498106.1695466}
+{"t": "act_call", "cls": "ShortSeriesActivity", "m": "setIntent", "switch_seq": 2, "ts": 1776498106634, "_recv_ts": 1776498106.2735274}
+{"t": "act_call", "cls": "ShortSeriesActivity", "m": "onCreate", "switch_seq": 2, "ts": 1776498106647, "_recv_ts": 1776498106.2861595}
+{"t": "act_call", "cls": "ShortSeriesActivity", "m": "onResume", "switch_seq": 2, "ts": 1776498106682, "_recv_ts": 1776498106.3237808}
+{"t": "vp_set", "cls": "ViewPager2", "pos": 45, "switch_seq": 2, "ts": 1776498106874, "_recv_ts": 1776498106.5136976}
+{"t": "bind", "vid": "7620996517578411070", "idx": 46, "series_id": "7617050216549583897", "name": "null", "total_eps": 60, "ts": 1776498107129, "switch_seq": 2, "_recv_ts": 1776498106.7677348}
+{"t": "bind", "vid": "7620996517578411070", "idx": 46, "series_id": "7617050216549583897", "name": "null", "total_eps": 60, "ts": 1776498107130, "switch_seq": 2, "_recv_ts": 1776498106.7691212}
+{"t": "http", "url": "https://reading.snssdk.com/reading/bookapi/plan/v?total_chapter_num=0&extra_params=%7B%22713_video_bottom_bar_related_novel%22%3A%22%22%7D&filter_ids=7617050216549583897&offset=0&current_chapter_num=0&search_middle_page_version=0&user_is_login=0&bookstore_tab=0&bookstore_tab_type=0&book_id=7617050216549583897&scene=10&new_search_middle_page=false&hot_word_exchange=false&last_search_page_interval=0", "code": 200, "dt": 339, "switch_seq": 2, "ts": 1776498107532, "_recv_ts": 1776498107.1719072}
+{"t": "http", "url": "https://ad.zijieapi.com/api/ad/v1/recall_ads/banner/?rit=58036&xs_req_info=%7B%22short_series_id%22%3A%227617050216549583897%22%2C%22short_series_video_id%22%3A%227620996517578411070%22%2C%22short_series_entrance%22%3A0%2C%22short_series_pos%22%3A45%2C%22short_series_index%22%3A45%2C%22xs_book_id%22%3A%227617050216549583897%22%2C%22short_series_count%22%3A60%2C%22is_no_active%22%3A0%2C%22is_from_o", "code": 200, "dt": 500, "switch_seq": 2, "ts": 1776498107747, "_recv_ts": 1776498107.3859403}
+{"t": "bind", "vid": "7620997649537190974", "idx": 47, "series_id": "7617050216549583897", "name": "null", "total_eps": 60, "ts": 1776498107748, "switch_seq": 2, "_recv_ts": 1776498107.3873684}
+{"t": "bind", "vid": "7620997649537190974", "idx": 47, "series_id": "7617050216549583897", "name": "null", "total_eps": 60, "ts": 1776498107749, "switch_seq": 2, "_recv_ts": 1776498107.387594}
+{"t": "bind", "vid": "7620656626357259326", "idx": 45, "series_id": "7617050216549583897", "name": "null", "total_eps": 60, "ts": 1776498107949, "switch_seq": 2, "_recv_ts": 1776498107.5888803}
+{"t": "bind", "vid": "7620656626357259326", "idx": 45, "series_id": "7617050216549583897", "name": "null", "total_eps": 60, "ts": 1776498107950, "switch_seq": 2, "_recv_ts": 1776498107.5892267}
+{"t": "cap", "kid": "69c33878559c7a74b9d9dc2a0003ebeb", "ts": 1776498108242, "switch_seq": 2, "_recv_ts": 1776498107.88202}
+{"t": "http", "url": "https://reading.snssdk.com/reading/distribution/book_pack_fields/series_detail_info/v1", "code": 200, "dt": 175, "switch_seq": 2, "ts": 1776498108376, "_recv_ts": 1776498108.0166094}
+{"t": "args_set", "m": "setContext", "v": "com.dragon.read.component.shortvideo.imp", "switch_seq": 3, "ts": 1776498114572, "_recv_ts": 1776498114.2118762}
+{"t": "args_set", "m": "setSeriesId", "v": "7617050216549583897", "switch_seq": 3, "ts": 1776498114574, "_recv_ts": 1776498114.2135794}
+{"t": "args_set", "m": "setVideoClickPos", "v": "46", "switch_seq": 3, "ts": 1776498114576, "_recv_ts": 1776498114.215302}
+{"t": "args_set", "m": "setVideoForcePos", "v": "46", "switch_seq": 3, "ts": 1776498114577, "_recv_ts": 1776498114.2154863}
+{"t": "args_set", "m": "setClearTop", "v": "true", "switch_seq": 3, "ts": 1776498114578, "_recv_ts": 1776498114.2175922}
+{"t": "cap", "kid": "69c33878559c7a74b9d9dc2a0003ebeb", "ts": 1776498114601, "switch_seq": 3, "_recv_ts": 1776498114.2415662}
+{"t": "act_call", "cls": "ShortSeriesActivity", "m": "setIntent", "switch_seq": 3, "ts": 1776498114756, "_recv_ts": 1776498114.3951693}
+{"t": "act_call", "cls": "ShortSeriesActivity", "m": "onCreate", "switch_seq": 3, "ts": 1776498114767, "_recv_ts": 1776498114.4056787}
+{"t": "act_call", "cls": "ShortSeriesActivity", "m": "onResume", "switch_seq": 3, "ts": 1776498114810, "_recv_ts": 1776498114.4491527}
+{"t": "vp_set", "cls": "ViewPager2", "pos": 46, "switch_seq": 3, "ts": 1776498115009, "_recv_ts": 1776498114.648213}
+{"t": "bind", "vid": "7620997649537190974", "idx": 47, "series_id": "7617050216549583897", "name": "null", "total_eps": 60, "ts": 1776498115297, "switch_seq": 3, "_recv_ts": 1776498114.9358902}
+{"t": "bind", "vid": "7620997649537190974", "idx": 47, "series_id": "7617050216549583897", "name": "null", "total_eps": 60, "ts": 1776498115297, "switch_seq": 3, "_recv_ts": 1776498114.936219}
+{"t": "http", "url": "https://reading.snssdk.com/reading/bookapi/plan/v?total_chapter_num=0&extra_params=%7B%22713_video_bottom_bar_related_novel%22%3A%22%22%7D&filter_ids=7617050216549583897&offset=0&current_chapter_num=0&search_middle_page_version=0&user_is_login=0&bookstore_tab=0&bookstore_tab_type=0&book_id=7617050216549583897&scene=10&new_search_middle_page=false&hot_word_exchange=false&last_search_page_interval=0", "code": 200, "dt": 392, "switch_seq": 3, "ts": 1776498115760, "_recv_ts": 1776498115.399273}
+{"t": "bind", "vid": "7620998374837210174", "idx": 48, "series_id": "7617050216549583897", "name": "null", "total_eps": 60, "ts": 1776498115934, "switch_seq": 3, "_recv_ts": 1776498115.5736222}
+{"t": "bind", "vid": "7620998374837210174", "idx": 48, "series_id": "7617050216549583897", "name": "null", "total_eps": 60, "ts": 1776498115935, "switch_seq": 3, "_recv_ts": 1776498115.5741982}
+{"t": "http", "url": "https://ad.zijieapi.com/api/ad/v1/recall_ads/banner/?rit=58036&xs_req_info=%7B%22short_series_id%22%3A%227617050216549583897%22%2C%22short_series_video_id%22%3A%227620997649537190974%22%2C%22short_series_entrance%22%3A0%2C%22short_series_pos%22%3A46%2C%22short_series_index%22%3A46%2C%22xs_book_id%22%3A%227617050216549583897%22%2C%22short_series_count%22%3A60%2C%22is_no_active%22%3A0%2C%22is_from_o", "code": 200, "dt": 565, "switch_seq": 3, "ts": 1776498116008, "_recv_ts": 1776498115.6478443}
+{"t": "bind", "vid": "7620996517578411070", "idx": 46, "series_id": "7617050216549583897", "name": "null", "total_eps": 60, "ts": 1776498116150, "switch_seq": 3, "_recv_ts": 1776498115.789624}
+{"t": "bind", "vid": "7620996517578411070", "idx": 46, "series_id": "7617050216549583897", "name": "null", "total_eps": 60, "ts": 1776498116151, "switch_seq": 3, "_recv_ts": 1776498115.7912757}
+{"t": "cap", "kid": "69c33947559c7a1e579e51db0002ebeb", "ts": 1776498116452, "switch_seq": 3, "_recv_ts": 1776498116.0916772}
+{"t": "http", "url": "https://reading.snssdk.com/reading/distribution/book_pack_fields/series_detail_info/v1", "code": 200, "dt": 164, "switch_seq": 3, "ts": 1776498116610, "_recv_ts": 1776498116.2505913}
+{"t": "http", "url": "https://api.fqnovel.com/luckycat/novel/1/task/daily_short_video_collect/auto_add", "code": 200, "dt": 271, "switch_seq": 3, "ts": 1776498119811, "_recv_ts": 1776498119.4530602}
+{"t": "args_set", "m": "setContext", "v": "com.dragon.read.component.shortvideo.imp", "switch_seq": 4, "ts": 1776498122667, "_recv_ts": 1776498122.307835}
+{"t": "args_set", "m": "setSeriesId", "v": "7617050216549583897", "switch_seq": 4, "ts": 1776498122669, "_recv_ts": 1776498122.3113284}
+{"t": "args_set", "m": "setVideoClickPos", "v": "48", "switch_seq": 4, "ts": 1776498122670, "_recv_ts": 1776498122.3117626}
+{"t": "args_set", "m": "setVideoForcePos", "v": "48", "switch_seq": 4, "ts": 1776498122672, "_recv_ts": 1776498122.3119428}
+{"t": "args_set", "m": "setClearTop", "v": "true", "switch_seq": 4, "ts": 1776498122676, "_recv_ts": 1776498122.3161435}
+{"t": "cap", "kid": "69c65328559c7a26a0763c4f0002ebeb", "ts": 1776498122710, "switch_seq": 4, "_recv_ts": 1776498122.3492992}
+{"t": "act_call", "cls": "ShortSeriesActivity", "m": "setIntent", "switch_seq": 4, "ts": 1776498122801, "_recv_ts": 1776498122.4409945}
+{"t": "act_call", "cls": "ShortSeriesActivity", "m": "onCreate", "switch_seq": 4, "ts": 1776498122814, "_recv_ts": 1776498122.4536116}
+{"t": "act_call", "cls": "ShortSeriesActivity", "m": "onResume", "switch_seq": 4, "ts": 1776498122856, "_recv_ts": 1776498122.4958405}
+{"t": "vp_set", "cls": "ViewPager2", "pos": 48, "switch_seq": 4, "ts": 1776498123068, "_recv_ts": 1776498122.7071047}
+{"t": "bind", "vid": "7621005701627792446", "idx": 49, "series_id": "7617050216549583897", "name": "null", "total_eps": 60, "ts": 1776498123390, "switch_seq": 4, "_recv_ts": 1776498123.0289974}
+{"t": "bind", "vid": "7621005701627792446", "idx": 49, "series_id": "7617050216549583897", "name": "null", "total_eps": 60, "ts": 1776498123390, "switch_seq": 4, "_recv_ts": 1776498123.0307264}
+{"t": "http", "url": "https://reading.snssdk.com/reading/bookapi/plan/v?total_chapter_num=0&extra_params=%7B%22713_video_bottom_bar_related_novel%22%3A%22%22%7D&filter_ids=7617050216549583897&offset=0&current_chapter_num=0&search_middle_page_version=0&user_is_login=0&bookstore_tab=0&bookstore_tab_type=0&book_id=7617050216549583897&scene=10&new_search_middle_page=false&hot_word_exchange=false&last_search_page_interval=0", "code": 200, "dt": 538, "switch_seq": 4, "ts": 1776498124008, "_recv_ts": 1776498123.648126}
+{"t": "bind", "vid": "7621007116618189886", "idx": 50, "series_id": "7617050216549583897", "name": "null", "total_eps": 60, "ts": 1776498124120, "switch_seq": 4, "_recv_ts": 1776498123.7597997}
+{"t": "bind", "vid": "7621007116618189886", "idx": 50, "series_id": "7617050216549583897", "name": "null", "total_eps": 60, "ts": 1776498124120, "switch_seq": 4, "_recv_ts": 1776498123.7616994}
+{"t": "http", "url": "https://ad.zijieapi.com/api/ad/v1/recall_ads/banner/?rit=58036&xs_req_info=%7B%22short_series_id%22%3A%227617050216549583897%22%2C%22short_series_video_id%22%3A%227621005701627792446%22%2C%22short_series_entrance%22%3A0%2C%22short_series_pos%22%3A48%2C%22short_series_index%22%3A48%2C%22xs_book_id%22%3A%227617050216549583897%22%2C%22short_series_count%22%3A60%2C%22is_no_active%22%3A0%2C%22is_from_o", "code": 200, "dt": 721, "switch_seq": 4, "ts": 1776498124305, "_recv_ts": 1776498123.9447334}
+{"t": "bind", "vid": "7620998374837210174", "idx": 48, "series_id": "7617050216549583897", "name": "null", "total_eps": 60, "ts": 1776498124341, "switch_seq": 4, "_recv_ts": 1776498123.981694}
+{"t": "bind", "vid": "7620998374837210174", "idx": 48, "series_id": "7617050216549583897", "name": "null", "total_eps": 60, "ts": 1776498124343, "switch_seq": 4, "_recv_ts": 1776498123.986205}
+{"t": "cap", "kid": "69c34125559c7a90f1b6bb250003ebeb", "ts": 1776498124628, "switch_seq": 4, "_recv_ts": 1776498124.267422}
+{"t": "http", "url": "https://reading.snssdk.com/reading/distribution/book_pack_fields/series_detail_info/v1", "code": 200, "dt": 233, "switch_seq": 4, "ts": 1776498124839, "_recv_ts": 1776498124.4791136}

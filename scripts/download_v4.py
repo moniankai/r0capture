@@ -172,6 +172,10 @@ class State:
         self.last_new: Capture | None = None
         self.cluster: str | None = cluster
         self.rejected = 0
+        # armed 模式:tap 前 arm_for_tap() → ingest 时捕获首个 cap 到 first_cap_after_arm
+        # 防止"Agent 调 wait_capture 晚于 fire"导致 last_new 被后续预加载覆盖。
+        self.armed: bool = False
+        self.first_cap_after_arm: Capture | None = None
 
     def ingest(self, p: dict) -> bool:
         kid = p.get('kid', '')
@@ -211,24 +215,49 @@ class State:
         with self.lock:
             self.by_kid[kid] = cap
             self.last_new = cap
+            # 如果处于 armed 模式,捕获首个 cap 到 first_cap_after_arm
+            # 后续 fire 不再覆盖(实现"tap 后首个 fire"的可靠抓取,免受 Agent 调用延迟影响)
+            if self.armed and self.first_cap_after_arm is None:
+                self.first_cap_after_arm = cap
         return True
 
+    def arm_for_tap(self):
+        """tap 前调用:清残留 + 武装状态,下一个 ingest 会保存到 first_cap_after_arm。"""
+        with self.lock:
+            self.last_new = None
+            self.first_cap_after_arm = None
+            self.armed = True
+
     def wait_new(self, timeout: float = 4.0, settle: float = 1.5) -> Capture | None:
-        """等首个新 cap → 再吸收 settle 秒内的后续 fire → 返回末个。
-        App 在 tap 当前集时可能先 fire 预加载下一集，末个 cap 更可能是当前集。
+        """settle-then-last: 等首个 fire → settle 秒吸收后续 → 返回 last_new。
+        实证规律(2026-04-18): tap 面板按钮 N → fire 两次 setVideoModel,末个 = 第(N+1)集
+        的 kid(预加载下一集)。上层调用方靠"错位补偿"(想下第 M 集,tap 按钮 M-1)利用此规律。
+        armed 机制保留但默认不用。
         """
         deadline = time.time() + timeout
-        first_seen_ts = None
+        first_seen = False
         while time.time() < deadline:
             with self.lock:
+                if self.armed and self.first_cap_after_arm is not None:
+                    c = self.first_cap_after_arm
+                    self.first_cap_after_arm = None
+                    self.armed = False
+                    return c
                 if self.last_new is not None:
-                    first_seen_ts = time.time()
+                    first_seen = True
                     break
-            time.sleep(0.1)
-        if first_seen_ts is None:
+            time.sleep(0.05)
+        if not first_seen:
             return None
-        time.sleep(settle)
+        if settle > 0:
+            time.sleep(settle)
         with self.lock:
+            # armed 状态优先
+            if self.first_cap_after_arm is not None:
+                c = self.first_cap_after_arm
+                self.first_cap_after_arm = None
+                self.armed = False
+                return c
             c = self.last_new
             self.last_new = None
         return c
@@ -305,9 +334,50 @@ def scan_panel(total_eps: int) -> tuple[dict[int, tuple[int,int]], dict[str, tup
     else:
         segments = [('1-30', 1, 30), ('31-60', 31, 60), (f'61-{total_eps}', 61, total_eps)]
 
-    logger.info("[扫描] tap 选集按钮...")
-    run_adb(["shell", "input", "tap", "540", "1820"])
-    time.sleep(2.0)
+    # 动态定位"选集" tab/按钮(App 有紧凑/详情两种模式,坐标不同)
+    def _find_xuanji_tap_xy() -> tuple[int, int] | None:
+        xml0 = read_ui_xml_from_device()
+        if not xml0:
+            return None
+        try:
+            root0 = ET.fromstring(xml0)
+        except ET.ParseError:
+            return None
+        cands = []
+        for n in root0.iter('node'):
+            if (n.get('text') or '').strip() == '选集':
+                b = _parse_bounds(n.get('bounds') or '')
+                if b:
+                    cands.append(((b[0]+b[2])//2, (b[1]+b[3])//2))
+        if not cands:
+            return None
+        cands.sort(key=lambda xy: -xy[1])  # 取最下方
+        return cands[0]
+
+    def _panel_visible_now() -> bool:
+        xml0 = read_ui_xml_from_device()
+        if not xml0:
+            return False
+        try:
+            root0 = ET.fromstring(xml0)
+        except ET.ParseError:
+            return False
+        return sum(
+            1 for n in root0.iter('node')
+            if (n.get('resource-id') or '').endswith('/ivi')
+            and (n.get('text') or '').strip().isdigit()
+        ) >= 5
+
+    logger.info("[扫描] 尝试打开选集面板...")
+    if not _panel_visible_now():
+        xy = _find_xuanji_tap_xy()
+        if xy:
+            logger.info(f"[扫描] 动态找到 '选集' @ {xy}, tap")
+            run_adb(["shell", "input", "tap", str(xy[0]), str(xy[1])])
+        else:
+            logger.warning("[扫描] XML 未找到 '选集' 节点,退回 (540,1820)")
+            run_adb(["shell", "input", "tap", "540", "1820"])
+        time.sleep(2.0)
 
     seg_btn: dict[str, tuple[int,int]] = {}
     xml = read_ui_xml_from_device()

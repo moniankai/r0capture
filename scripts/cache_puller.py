@@ -60,8 +60,9 @@ def pull_and_sort_cache(output_dir: str) -> int:
     # 生成 concat 列表
     concat_file = output_path / "concat_list.txt"
     with open(concat_file, "w", encoding="utf-8") as f:
-        for i in range(len(sorted_files)):
-            f.write(f"file '{i+1:03d}_*.mdl'\n")
+        for i, file_info in enumerate(sorted_files):
+            local_name = f"{i+1:03d}_{file_info['name']}"
+            f.write(f"file '{local_name}'\n")
 
     logger.info(f"生成 concat 列表: {concat_file}")
     return len(sorted_files)

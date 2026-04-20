@@ -28,6 +28,7 @@ if sys.platform == "win32":
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts.cache_puller import pull_and_sort_cache
+from scripts.decrypt_video import decrypt_mp4, fix_metadata
 from scripts.video_merger import merge_videos
 from scripts.ocr_detector import detect_episode_boundaries
 from scripts.split_planner import generate_split_plan
@@ -42,6 +43,7 @@ def main():
     parser.add_argument("--expected-episodes", type=int, default=60, help="预期集数")
     parser.add_argument("--step", choices=["pull", "merge", "ocr", "split", "validate"], help="只执行指定步骤")
     parser.add_argument("--sample-interval", type=int, default=30, help="OCR 采样间隔（秒）")
+    parser.add_argument("--key", help="AES-128 解密密钥（32位hex），缓存文件通常是 CENC 加密的")
 
     args = parser.parse_args()
 
@@ -78,6 +80,29 @@ def main():
         logger.info(f"✓ 拉取完成: {file_count} 个文件")
         if args.step:
             return
+
+    # 步骤 1.5: 解密缓存文件
+    if args.key and (not args.step or args.step in ("pull", "merge")):
+        key_bytes = bytes.fromhex(args.key)
+        if len(key_bytes) != 16:
+            logger.error(f"密钥必须是 16 字节（32 位 hex），当前 {len(key_bytes)} 字节")
+            return
+        mdl_files = sorted(cache_dir.glob("*.mdl"))
+        logger.info(f"[1.5/5] 解密 {len(mdl_files)} 个缓存文件...")
+        for i, mdl in enumerate(mdl_files):
+            try:
+                with open(mdl, "rb") as f:
+                    data = bytearray(f.read())
+                count = decrypt_mp4(data, key_bytes)
+                if count > 0:
+                    fix_metadata(data)
+                    with open(mdl, "wb") as f:
+                        f.write(data)
+                    logger.info(f"  解密 [{i+1}/{len(mdl_files)}]: {mdl.name} ({count} samples)")
+                else:
+                    logger.warning(f"  跳过 [{i+1}/{len(mdl_files)}]: {mdl.name} (无加密数据)")
+            except Exception as e:
+                logger.warning(f"  跳过 [{i+1}/{len(mdl_files)}]: {mdl.name} (解析失败: {e})")
 
     # 步骤 2: 合并全集
     if not args.step or args.step == "merge":

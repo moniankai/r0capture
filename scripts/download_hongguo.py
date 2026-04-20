@@ -626,6 +626,9 @@ def navigate_to_drama_via_search(drama_name: str, timeout: float = 25.0) -> bool
     run_adb(["shell", "input", "tap", "984", "150"])
     time.sleep(5)
     # 动态定位剧名：dump 搜索结果 XML，找到 text == drama_name 且 y > 250（排除搜索输入框）的节点
+    # 策略：在 XML 中先找到剧名节点，再找它所在的卡片容器，筛选条件：
+    #   1. 卡片附近有 "万热度" 文本（正片特征；合集卡片没有"热度"只有"播放"）
+    #   2. 若多个候选，取 x 最左（主推荐通常在左侧）+ 热度值最大
     import xml.etree.ElementTree as _ET
     import re as _re
     target_bounds = None
@@ -634,7 +637,8 @@ def navigate_to_drama_via_search(drama_name: str, timeout: float = 25.0) -> bool
         if xml_text:
             try:
                 root = _ET.fromstring(xml_text)
-                candidates = []
+                # 收集所有剧名 node 的 bounds
+                name_nodes = []
                 for node in root.iter('node'):
                     if node.get('text', '') != drama_name:
                         continue
@@ -642,13 +646,40 @@ def navigate_to_drama_via_search(drama_name: str, timeout: float = 25.0) -> bool
                     if not m:
                         continue
                     x1, y1, x2, y2 = map(int, m.groups())
-                    if y1 < 250:  # 搜索输入框
+                    if y1 < 250:
                         continue
-                    candidates.append((x1, y1, x2, y2))
-                if candidates:
-                    # 取 y 最小（最靠上的卡片）
-                    candidates.sort(key=lambda b: b[1])
-                    target_bounds = candidates[0]
+                    name_nodes.append((x1, y1, x2, y2))
+                # 收集所有 "XXX万热度" 节点的 bounds 与热度数值
+                heat_nodes = []
+                for node in root.iter('node'):
+                    t = node.get('text', '')
+                    hm = _re.match(r'(\d+)万热度', t)
+                    if not hm:
+                        continue
+                    m = _re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', node.get('bounds', ''))
+                    if not m:
+                        continue
+                    x1, y1, x2, y2 = map(int, m.groups())
+                    heat_nodes.append((x1, y1, x2, y2, int(hm.group(1))))
+                # 为每个剧名卡片匹配最近的热度节点（y 差 < 200 且 x 重叠）
+                scored = []
+                for (nx1, ny1, nx2, ny2) in name_nodes:
+                    best_heat = 0
+                    for (hx1, hy1, hx2, hy2, heat) in heat_nodes:
+                        # 同一卡片：y 差 < 200 且 x 区间重叠
+                        if abs(hy2 - ny1) > 200 and abs(hy1 - ny2) > 200:
+                            continue
+                        if hx2 < nx1 or hx1 > nx2:
+                            continue
+                        if heat > best_heat:
+                            best_heat = heat
+                    scored.append((best_heat, nx1, ny1, nx2, ny2))
+                # 优先选热度最高；相同热度取 x 最左
+                scored.sort(key=lambda s: (-s[0], s[1]))
+                if scored:
+                    best_heat, x1, y1, x2, y2 = scored[0]
+                    target_bounds = (x1, y1, x2, y2)
+                    logger.info(f"[导航] 候选卡片: {[(s[0], s[1]) for s in scored]}, 选中热度={best_heat}万")
                     break
             except _ET.ParseError:
                 pass

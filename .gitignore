@@ -31,6 +31,11 @@ videos_redownload_smoke/
 _*.png
 _*.xml
 
+# === Secrets ===
+.env
+.env.local
+.env.*.local
+
 # === Runtime JSON output (capture results, not config) ===
 all_captured_urls.json
 captured_keys.json

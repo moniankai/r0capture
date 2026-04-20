@@ -1,0 +1,42 @@
+Probe ep48 根因定位报告
+剧: 《null》 series_id=7617050216549583897 total=60
+测试集: [46, 47, 48, 50]
+总事件: 83
+
+
+===== ep46 (pos=44) =====
+事件分布: {'args_set': 5, 'cap': 2, 'act_call': 3, 'vp_set': 1, 'bind': 6, 'http': 3}
+BIND idx序列: [45, 45, 46, 46, 44, 44]
+CAP 次数: 2
+HTTP 请求 (3):
+  [200] https://reading.snssdk.com/reading/bookapi/plan/v?total_chapter_num=0&extra_params=%7B%22713_video_bottom_bar_related_novel%22%3A%22%22%7D&filter_ids=7617050216549583897&offset=0&current_chapter_num=0
+  [200] https://ad.zijieapi.com/api/ad/v1/recall_ads/banner/?rit=58036&xs_req_info=%7B%22short_series_id%22%3A%227617050216549583897%22%2C%22short_series_video_id%22%3A%227620656626357259326%22%2C%22short_ser
+  [200] https://reading.snssdk.com/reading/distribution/book_pack_fields/series_detail_info/v1
+
+===== ep47 (pos=45) =====
+事件分布: {'args_set': 5, 'cap': 2, 'act_call': 3, 'vp_set': 1, 'bind': 6, 'http': 3}
+BIND idx序列: [46, 46, 47, 47, 45, 45]
+CAP 次数: 2
+HTTP 请求 (3):
+  [200] https://reading.snssdk.com/reading/bookapi/plan/v?total_chapter_num=0&extra_params=%7B%22713_video_bottom_bar_related_novel%22%3A%22%22%7D&filter_ids=7617050216549583897&offset=0&current_chapter_num=0
+  [200] https://ad.zijieapi.com/api/ad/v1/recall_ads/banner/?rit=58036&xs_req_info=%7B%22short_series_id%22%3A%227617050216549583897%22%2C%22short_series_video_id%22%3A%227620996517578411070%22%2C%22short_ser
+  [200] https://reading.snssdk.com/reading/distribution/book_pack_fields/series_detail_info/v1
+
+===== ep48 (pos=46) =====
+事件分布: {'args_set': 5, 'cap': 2, 'act_call': 3, 'vp_set': 1, 'bind': 6, 'http': 4}
+BIND idx序列: [47, 47, 48, 48, 46, 46]
+CAP 次数: 2
+HTTP 请求 (4):
+  [200] https://reading.snssdk.com/reading/bookapi/plan/v?total_chapter_num=0&extra_params=%7B%22713_video_bottom_bar_related_novel%22%3A%22%22%7D&filter_ids=7617050216549583897&offset=0&current_chapter_num=0
+  [200] https://ad.zijieapi.com/api/ad/v1/recall_ads/banner/?rit=58036&xs_req_info=%7B%22short_series_id%22%3A%227617050216549583897%22%2C%22short_series_video_id%22%3A%227620997649537190974%22%2C%22short_ser
+  [200] https://reading.snssdk.com/reading/distribution/book_pack_fields/series_detail_info/v1
+  [200] https://api.fqnovel.com/luckycat/novel/1/task/daily_short_video_collect/auto_add
+
+===== ep50 (pos=48) =====
+事件分布: {'args_set': 5, 'cap': 2, 'act_call': 3, 'vp_set': 1, 'bind': 6, 'http': 3}
+BIND idx序列: [49, 49, 50, 50, 48, 48]
+CAP 次数: 2
+HTTP 请求 (3):
+  [200] https://reading.snssdk.com/reading/bookapi/plan/v?total_chapter_num=0&extra_params=%7B%22713_video_bottom_bar_related_novel%22%3A%22%22%7D&filter_ids=7617050216549583897&offset=0&current_chapter_num=0
+  [200] https://ad.zijieapi.com/api/ad/v1/recall_ads/banner/?rit=58036&xs_req_info=%7B%22short_series_id%22%3A%227617050216549583897%22%2C%22short_series_video_id%22%3A%227621005701627792446%22%2C%22short_ser
+  [200] https://reading.snssdk.com/reading/distribution/book_pack_fields/series_detail_info/v1
