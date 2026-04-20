@@ -2,11 +2,16 @@
 
 安卓 SSL 通杀抓包脚本，扩展支持红果免费短剧的 CENC 加密视频一键下载。
 
+> **⭐ 新版红果 App 请用 [README-LEAN.md](README-LEAN.md) 的 lean-2session 架构**
+> （已在 4 部剧 250+ 集验证 0 串集 0 缺集）
+> 以下 `download_drama.py` / `hongguo_agent.py` 为旧架构（legacy），在 2026-04 起的 App 版本上已失效。
+
 ---
 
 ## 目录
 
-- [红果短剧下载器](#红果短剧下载器)
+- **[lean-2session 架构（推荐，新版 App 唯一可用）](README-LEAN.md)**
+- [红果短剧下载器 (legacy)](#红果短剧下载器)
   - [环境准备](#环境准备)
   - [配置文件](#配置文件)
   - [操作流程](#操作流程)

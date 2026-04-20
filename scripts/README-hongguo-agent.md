@@ -1,8 +1,19 @@
-# 红果短剧无人值守下载 Agent — 使用手册
+# 红果短剧无人值守下载 Agent — 使用手册 (LEGACY)
+
+> **⚠️ 此架构已失效（2026-04-20 起）**。新版红果 App 的 Frida 路径变更导致多 hook + RPC 模型
+> 全面超时。本文档保留作参考。
+>
+> **新版请用 [lean-2session 架构](../README-LEAN.md)**（已在 4 部剧 250+ 集验证 0 串集 0 缺集）：
+> - `scripts/spawn_nav.py` + `scripts/v5_lean.py` + `scripts/verify_drama.py` + `scripts/hongguo_batch_lean.py`
+> - 单 hook（仅 `ot3.z.B0`）+ 2 session（零 hook 做 RPC + 单 hook 做监听）
+> - 完全兼容 `hongguo_batch.py` 的输入格式（`{name, series_id, total}`）
+
+---
 
 **目标**: 输入剧名 + series_id → Agent 全自动下载完整剧集 + 对齐验证 + 产出报告, 无需人工干预。
 
 **架构**: 分层设计 (详见 [`docs/superpowers/specs/2026-04-18-hongguo-agent-design.md`](../docs/superpowers/specs/2026-04-18-hongguo-agent-design.md))
+
 - `hongguo_batch.py` — BatchAgent (多剧串行调度 + 设备自愈 + resume)
 - `hongguo_agent.py` — Orchestrator (FSM + Watchdog + Recovery + 熔断)
 - `hongguo_v5.py` — 可监督的 runner (4 种启动模式 + 事件流 + 原子提交 + ot3.z.B0 强绑定 Hook)

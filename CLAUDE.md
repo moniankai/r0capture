@@ -16,15 +16,27 @@ pip install imageio-ffmpeg faster-whisper
 ```
 
 ### 短剧下载器（主要工作流）
+
+**推荐：lean-2session 架构**（新版 App 唯一可用，详见 [README-LEAN.md](README-LEAN.md)）：
+
 ```bash
-# 手动模式 — 用户在手机上操作，脚本自动捕获
-python scripts/download_drama.py
+# 单部剧 3 步
+python scripts/spawn_nav.py --series-id 7622955207885851672 --pos 0
+python scripts/v5_lean.py -n "开局一条蛇，无限进化" --series-id 7622955207885851672 -t 83
+python scripts/verify_drama.py -n "开局一条蛇，无限进化" -t 83 --series-id 7622955207885851672
 
-# 搜索模式 — 全自动（需 ADBKeyboard）
-python scripts/download_drama.py -n "剧名" --search -e 1 -b 10
+# 批量 (消费 dramas.json, 自动编排 spawn_nav+v5_lean+verify)
+python scripts/hongguo_batch_lean.py --input .planning/rankings/dramas.json \
+    --max-total 100 --max-dramas 10
+```
 
-# 挂载到已运行的 App
-python scripts/download_drama.py --attach-running -n "剧名"
+**已失效 (legacy，2026-04 起新 App 不可用)**：
+
+```bash
+# 基于多 hook + RPC, Frida 阻塞导致全失效
+python scripts/download_drama.py                          # 老单部工具
+python scripts/hongguo_batch.py --input dramas.json       # 老批量
+python scripts/hongguo_agent.py -n "剧名" --series-id X   # 老 Agent
 ```
 
 ### 通用 SSL 抓包（原始 r0capture）
@@ -71,18 +83,30 @@ pytest tests/test_audit_drama_downloads.py -v
 
 ### 核心模块
 
+**lean-2session 架构（当前推荐）**：
+
 | 模块 | 职责 |
 |------|------|
-| `scripts/download_drama.py` | 主入口：编排 Hook、捕获、下载、解密全流程 |
+| `scripts/spawn_nav.py` | Session A：spawn App + Intent 跳 ShortSeriesActivity（零 hook） |
+| `scripts/v5_lean.py` | Session B：attach + 单 B0 hook + 双向扫描下载全集 |
+| `scripts/verify_drama.py` | 6 项机械校验 + 抽首/中/末 3×3 帧 |
+| `scripts/hongguo_batch_lean.py` | 批量编排：消费 dramas.json, 串行调度 + 原子 state + resume |
+| `scripts/resolve_interactive.py` | 交互式采集 series_id（metadata 半成品） |
+| `scripts/find_crossed_episodes.py` | hash 扫描串集（verify_drama 内部调用） |
+
+**legacy 架构（新版 App 已失效，保留参考）**：
+
+| 模块 | 职责 |
+|------|------|
+| `scripts/download_drama.py` | 老单剧入口：多 hook + RPC |
 | `scripts/drama_download_common.py` | 共享工具：UI XML 解析、文件名生成、会话校验 |
 | `scripts/decrypt_video.py` | MP4 CENC 解密（AES-CTR-128，视频+音频双轨） |
-| `scripts/batch_manager.py` | 多线程批量下载队列，支持去重与断点续传 |
+| `scripts/batch_manager.py` | 老多线程下载队列 |
 | `scripts/preprocess_video.py` | LLM 预处理：关键帧提取 + Whisper ASR 转录 |
 | `scripts/audit_drama_downloads.py` | 离线审计：缺集检测、重复识别、重命名规划 |
 | `scripts/check_environment.py` | 设备环境校验：ADB、Frida Server 检测 |
-| `scripts/pcap_parser.py` | PCAP 文件解析，提取视频 URL |
-| `scripts/capture_key.py` | 专用 Frida Hook，捕获 AES 解密密钥 |
-| `honguo_capture.py` | 多模式编排器（cache/live/offline/hook） |
+| `scripts/hongguo_v5.py` | v5 legacy runner（保留给极少场景复用） |
+| `scripts/hongguo_agent.py` + `scripts/hongguo_batch.py` | 老 Agent + BatchAgent（已失效） |
 
 ### Frida Hook 体系（`frida_hooks/`）
 
