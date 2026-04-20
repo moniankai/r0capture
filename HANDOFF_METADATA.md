@@ -185,6 +185,14 @@ memory/feedback_*.md             — 各种坑（必读 feedback_miui_deeplink_h
 - [ ] 字段完整性：name/series_id/total 必填字段 100% 覆盖
 - [ ] 产出能直接喂 hongguo_batch_lean.py 跑 5 部（抽样）
 
+### ⚠️ 已知 bug（必读）
+
+**2026-04-20** 下载 session 发现 dramas.json 里 `series_id` 字段**存成了 ep1 的 biz_vid**。
+详见 `.planning/rankings/METADATA_BUG_REPORT.md`。
+
+修复要点：确认 hook 里写入 `series_id` 字段的来源是 `svd.getSeriesId()` 或 `svd.getEpisodesId()`，
+**不是** `svd.getVid()`（后者是当集 biz_vid）。修复后重采整份 dramas.json。
+
 ---
 
 ## 技术要点 & 陷阱
