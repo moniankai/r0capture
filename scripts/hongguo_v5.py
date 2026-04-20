@@ -620,65 +620,47 @@ rpc.exports = {
                 }
                 if (ctx === null) { resolve({ok:false, err:'no_ctx', seq: seq}); return; }
 
-                // 2) 构造 ShortSeriesLaunchArgs,关键 setter 校验
-                var Args, args;
+                // 2) Intent-based startActivity (绕过 NsShortVideoApi.openShortSeriesActivity
+                //    — 新版 App 里该 API 在"已在目标剧"时 no-op, 且 spawn 早期依赖 IMPL 未初始化.
+                //    直接 startActivity(Intent) + extras 从 App 内部调 App 内 Activity, 不受 exported 限制.
+                //    Intent schema 来自 diag_rpc_path hook 到的 App tap 剧卡片 startActivity 请求.)
+                var intent;
                 try {
-                    Args = Java.use('com.dragon.read.component.shortvideo.api.model.ShortSeriesLaunchArgs');
-                    args = Args.$new();
-                } catch(e) {
-                    resolve({ok:false, err:'Args.$new: ' + String(e), seq: seq});
-                    return;
-                }
-
-                function mustSet(name, fn) {
-                    try { fn(); } catch(e) { required.push(name + ':' + String(e)); }
-                }
-                function softSet(fn) { try { fn(); } catch(e){} }
-
-                mustSet('setContext',  function(){ args.setContext(ctx); });
-                mustSet('setSeriesId', function(){ args.setSeriesId(String(seriesId)); });
-                if (targetVid) {
-                    softSet(function(){ args.setTargetVideoId(String(targetVid)); });
-                    softSet(function(){ args.setFirstVid(String(targetVid)); });
-                    softSet(function(){ args.setVidForce(String(targetVid)); });
-                }
-                if (pos !== null && pos !== undefined && pos >= 0) {
-                    softSet(function(){ args.setVideoClickPos(pos); });
-                    softSet(function(){ args.setVideoForcePos(pos); });
-                }
-                softSet(function(){ args.setClearTop(true); });
-                softSet(function(){ args.setStartActivityWithoutAnyAnim(true); });
-                softSet(function(){ args.setEnableEnterAlphaAnimation(false); });
-                softSet(function(){ args.setEnableStartAnimation(false); });
-
-                if (required.length > 0) {
-                    resolve({ok:false, err:'missing setter:' + required.join(';'), seq: seq});
-                    return;
-                }
-
-                // 3) 拿 IMPL
-                var impl;
-                try {
-                    var Api = Java.use('com.dragon.read.component.shortvideo.api.NsShortVideoApi');
-                    impl = Api.IMPL.value;
-                } catch(e) {
-                    resolve({ok:false, err:'Api.IMPL: ' + String(e), seq: seq});
-                    return;
-                }
-                if (impl === null) { resolve({ok:false, err:'IMPL null', seq: seq}); return; }
-
-                // 4) 在 main thread 执行 + resolve 放 callback 内部.
-                //    这样 Python exports_sync 会等主线程真正完成才返回,天然节流
-                //    (防 scheduleOnMainThread callback 队列堆积 → ANR).
-                //    Python 侧用 rpc_switch (threading + join timeout=15s) 兜底异常卡死.
-                Java.scheduleOnMainThread(function() {
-                    try {
-                        impl.openShortSeriesActivity(args);
-                        resolve({ok: true, ctx: ctxName, seq: seq});
-                    } catch(e) {
-                        resolve({ok: false, err: 'open: ' + String(e), ctx: ctxName, seq: seq});
+                    var Intent = Java.use('android.content.Intent');
+                    intent = Intent.$new();
+                    intent.setClassName(String(ctx.getPackageName()),
+                        'com.dragon.read.component.shortvideo.impl.ShortSeriesActivity');
+                    intent.putExtra('short_series_id', String(seriesId));
+                    if (pos !== null && pos !== undefined && pos >= 0) {
+                        intent.putExtra('key_click_video_pos', parseInt(pos) || 0);
                     }
-                });
+                    if (targetVid) {
+                        intent.putExtra('key_first_vid', String(targetVid));
+                        intent.putExtra('key_highlight_vid', String(targetVid));
+                    }
+                    intent.putExtra('key_player_sub_tag', 'v5Rpc');
+                    intent.addFlags(0x10000000);  // FLAG_ACTIVITY_NEW_TASK
+                    intent.addFlags(0x04000000);  // FLAG_ACTIVITY_CLEAR_TOP
+                } catch(e) {
+                    resolve({ok:false, err:'intent_build: ' + String(e), seq: seq});
+                    return;
+                }
+
+                // 3) 强制用 Application ctx + 直接当前线程调 (不 schedule).
+                //    Application.startActivity + NEW_TASK flag 允许任意线程, 不依赖 UI thread.
+                //    scheduleOnMainThread 在 spawn 冷启动期 callback 排队阻塞 → Promise
+                //    resolve 没能 dispatch 到 Python 导致 15s timeout 假返回.
+                //    test_intent_start.py 在 attach 模式成功是因为 Main thread 空闲,
+                //    spawn 必须走无 schedule 路径.
+                try {
+                    var app = Java.use('android.app.ActivityThread')
+                                  .currentActivityThread().getApplication();
+                    app.startActivity(intent);
+                    resolve({ok: true, ctx: 'Application', seq: seq});
+                } catch(e) {
+                    resolve({ok: false, err: 'app.startActivity: ' + String(e),
+                             ctx: ctxName, seq: seq});
+                }
             });
         });
     }
@@ -1277,7 +1259,7 @@ def navigate_to_drama(drama: str, state: State, script, timeout: float = 30.0,
                     "-a", "android.intent.action.VIEW", "-d", url],
                    capture_output=True, env=env)
     logger.info(f"[nav] deeplink {url}")
-    time.sleep(3)
+    time.sleep(6)
 
     # 找 EditText, tap focus, 清空, 用 ADBKeyboard 输入
     def _find_search_edit() -> tuple[int, int] | None:
@@ -1295,6 +1277,9 @@ def navigate_to_drama(drama: str, state: State, script, timeout: float = 30.0,
                     return ((b[0]+b[2])//2, (b[1]+b[3])//2)
         return None
 
+    # Frida session 活跃时 uiautomator 常被阻塞 (search/播放器都有此现象)
+    # 失败兜底: 红果 SearchActivity 顶部 EditText 固定居中 ~(540, 150)
+    FALLBACK_EDIT_XY = (540, 150)
     edit_xy = None
     for _ in range(5):
         edit_xy = _find_search_edit()
@@ -1302,8 +1287,9 @@ def navigate_to_drama(drama: str, state: State, script, timeout: float = 30.0,
             break
         time.sleep(1)
     if not edit_xy:
-        logger.warning("[nav] 未找到搜索 EditText")
-        return None
+        logger.warning(f"[nav] 未找到搜索 EditText via uiautomator, "
+                       f"fallback tap {FALLBACK_EDIT_XY}")
+        edit_xy = FALLBACK_EDIT_XY
     logger.info(f"[nav] tap EditText @ {edit_xy}")
     run_adb(["shell", "input", "tap", str(edit_xy[0]), str(edit_xy[1])])
     time.sleep(0.8)
@@ -1319,12 +1305,13 @@ def navigate_to_drama(drama: str, state: State, script, timeout: float = 30.0,
          "--es", "msg", drama],
         capture_output=True, env=env, check=False,
     )
-    time.sleep(1.5)
-    # 收起键盘 (ADBKeyboard 可能留键盘覆盖"搜索"按钮)
-    run_adb(["shell", "input", "keyevent", "KEYCODE_BACK"])
-    time.sleep(0.8)
+    time.sleep(2.5)
+    # 不发 KEYCODE_BACK: MIUI 上 BACK 会退出搜索页 + 红果搜索按钮始终在顶部不被键盘遮挡
 
-    # 点"搜索"按钮触发搜索(找 text="搜索" 的 TextView)
+    # 点"搜索"按钮触发搜索 (Enter 在红果上不触发真搜索, 只能点按钮)
+    # 硬编码 fallback: 红果 SearchActivity 顶部右上"搜索"按钮固定 ~(984, 93)
+    FALLBACK_SEARCH_BTN_XY = (984, 93)
+
     def _tap_search_button() -> bool:
         xml = read_ui_xml_from_device()
         if not xml:
@@ -1345,8 +1332,10 @@ def navigate_to_drama(drama: str, state: State, script, timeout: float = 30.0,
         return False
 
     if not _tap_search_button():
-        logger.info("[nav] 未找到搜索按钮, 用 Enter 触发")
-        run_adb(["shell", "input", "keyevent", "KEYCODE_ENTER"])
+        logger.warning(f"[nav] 未找到搜索按钮 via uiautomator, "
+                       f"fallback tap {FALLBACK_SEARCH_BTN_XY}")
+        run_adb(["shell", "input", "tap",
+                 str(FALLBACK_SEARCH_BTN_XY[0]), str(FALLBACK_SEARCH_BTN_XY[1])])
 
     # 等搜索结果渲染 + 滚动触发更多结果的 SaasVideoData 创建
     # 每个结果渲染时会 setSeriesId/setSeriesName/setEpisodesCount,被我们的 catalog hook 捕获
@@ -1928,10 +1917,15 @@ def _download_main(args) -> int:
                             f"seq={b0.switch_seq}")
                 state.total_eps = b0.total_eps
             else:
-                # 阶段 2: RPC openShortSeriesActivity(pos=0) 强制切
+                # 阶段 1.5: spawn 冷启动 Main thread 被 splash→Main 切换 + Frida JIT 注入占满,
+                # scheduleOnMainThread callback 排队 15s+ 失败. 等 App 进 MainFragmentActivity
+                # 且 Main thread 空闲后再 RPC.
+                logger.info("[nav] 阶段 1.5: 等 App Main 稳定 15s")
+                time.sleep(15)
+                # 阶段 2: RPC Intent-based startActivity 进 ShortSeriesActivity
                 nav_seq = state.next_switch_seq()
                 logger.info(f"[nav] 阶段 2: RPC pos=0 seq={nav_seq}")
-                r = rpc_switch(script, args.series_id, None, 0, nav_seq, timeout=15.0)
+                r = rpc_switch(script, args.series_id, None, 0, nav_seq, timeout=20.0)
                 logger.info(f"[nav] rpc ok={r.get('ok')} ctx={r.get('ctx')} "
                             f"err={r.get('err')} timeout={r.get('timeout')}")
                 if not r.get('ok'):
@@ -1978,6 +1972,32 @@ def _download_main(args) -> int:
                     emit('fatal', detail='nav_bind_timeout')
                     return EXIT_ANR_SUSPECTED
                 state.total_eps = b0.total_eps
+        elif args.attach:
+            # Attach 模式 + 无 series_id: 假设调用方已手动 nav 到目标剧播放页
+            # (ShortSeriesActivity). 等首个 BIND 学 series_id + total.
+            logger.info("[nav] attach 模式: 等首个 BIND 学 series_id (10s)")
+            b0 = state.wait_first_valid_bind(min_total_eps=1, timeout=10.0, min_seq=0)
+            if not b0:
+                # swipe 触发 BIND
+                logger.info("[nav] 无自然 BIND, swipe 触发")
+                try:
+                    subprocess.run(
+                        ['adb', 'shell', 'input swipe 540 1400 540 400 300'],
+                        capture_output=True, timeout=3,
+                        env={**os.environ, 'MSYS_NO_PATHCONV': '1'})
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+                time.sleep(2.0)
+                b0 = state.wait_first_valid_bind(min_total_eps=1, timeout=10.0, min_seq=0)
+            if not b0 or not b0.series_id:
+                logger.error("attach 模式学 series_id 失败")
+                emit('fatal', detail='attach_learn_series_id_failed')
+                return EXIT_FATAL
+            state.target_series_id = b0.series_id
+            state.target_series_name = b0.name or args.name
+            state.total_eps = b0.total_eps
+            logger.info(f"[nav] attach 学到 series_id={b0.series_id} "
+                        f"total={b0.total_eps} ep={b0.idx}")
         else:
             b0 = navigate_to_drama(args.name, state, script, timeout=30,
                                     expected_total=expected_total)
