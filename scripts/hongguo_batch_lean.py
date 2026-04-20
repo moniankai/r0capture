@@ -204,20 +204,18 @@ def mark_state(state: dict, task: DramaTask, status: str, **extra) -> None:
 # ============ 子脚本调度 ============
 
 def run_subprocess(argv: list[str], timeout: float) -> tuple[int, str]:
-    """跑子脚本, 返回 (returncode, tail stderr)."""
+    """跑子脚本, 返回 (returncode, msg). 子进程 stdout/stderr 继承父进程 → 实时流式输出."""
     env = {**os.environ, 'MSYS_NO_PATHCONV': '1', 'PYTHONIOENCODING': 'utf-8'}
     try:
+        # 不 capture, 让子脚本日志直接打到父终端, 父进程用 tee 统一重定向
         r = subprocess.run(
-            [sys.executable] + argv,
-            capture_output=True, text=True, env=env,
-            timeout=timeout, encoding='utf-8', errors='replace',
+            [sys.executable] + argv, env=env, timeout=timeout,
         )
-    except subprocess.TimeoutExpired as e:
+    except subprocess.TimeoutExpired:
         return -1, f'timeout after {timeout}s'
     except Exception as e:
         return -1, f'exception: {e}'
-    tail = (r.stderr or r.stdout or '').splitlines()[-5:]
-    return r.returncode, ' | '.join(tail)[:500]
+    return r.returncode, f'rc={r.returncode}'
 
 
 def reboot_device(wait: float = 60.0) -> bool:

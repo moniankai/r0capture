@@ -185,13 +185,19 @@ memory/feedback_*.md             — 各种坑（必读 feedback_miui_deeplink_h
 - [ ] 字段完整性：name/series_id/total 必填字段 100% 覆盖
 - [ ] 产出能直接喂 hongguo_batch_lean.py 跑 5 部（抽样）
 
-### ⚠️ 已知 bug（必读）
+### ⚠️ 已知 bug（已修复 2026-04-20）
 
-**2026-04-20** 下载 session 发现 dramas.json 里 `series_id` 字段**存成了 ep1 的 biz_vid**。
+**2026-04-20 18:12** 下载 session 发现 dramas.json 里 `series_id` 字段**存成了 ep1 的 biz_vid**。
 详见 `.planning/rankings/METADATA_BUG_REPORT.md`。
 
-修复要点：确认 hook 里写入 `series_id` 字段的来源是 `svd.getSeriesId()` 或 `svd.getEpisodesId()`，
-**不是** `svd.getVid()`（后者是当集 biz_vid）。修复后重采整份 dramas.json。
+**修复 (2026-04-20 18:35)**: 在 `rank_collect.py` 的 JS_HOOK 里更正 j30 字段映射：
+- 错: `series_id = j30.J()` (实际返回 ep1 biz_vid)
+- 对: `series_id = j30.x()`（主）/ `j30.u()`（fallback，等价）
+- 错: `first_vid = j30.u()` (实际返回 series_id)
+- 对: `first_vid = j30.J()` (真正的 ep1 biz_vid)
+
+Ground truth 验证: 《疯美人》series_id = `7624372698860227646` 与下载 session
+实测值完全匹配。重采后 46 条 unique 字段完整性 100%, 无 first_vid == series_id 冲突。
 
 ---
 

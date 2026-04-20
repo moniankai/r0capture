@@ -1,9 +1,11 @@
 # Metadata 采集 Bug 报告
 
+**状态**: ✅ **已修复 (2026-04-20 18:35)** — 详见文末"修复记录"
+
 **发现时间**：2026-04-20 18:12
 **发现方**：下载验证 session（non-metadata）
 **验证数据**：`.planning/rankings/dramas.json`（46 部剧）
-**严重性**：**HIGH**（所有 46 部 series_id 字段可能错，batch 下载无法使用）
+**严重性**：**HIGH**（所有 46 部 series_id 字段错，batch 下载无法使用）
 
 ---
 
@@ -85,3 +87,54 @@ send({
 - `videos/疯美人/episode_002_69cf3842.mp4` (15.0MB)
 
 证明 v5_lean 架构无问题，瓶颈在 metadata 数据质量。
+
+---
+
+## 修复记录 (2026-04-20 18:35)
+
+### 真正根因
+
+**不是** hook 代码逻辑错误，**不是** SaasVideoData 字段写错 —— 本次 metadata session 用的
+是 Compose 榜单页的新架构 hook（见 `.planning/rankings/P1_采集器操作指南.md`），数据通路
+是 `SeriesRankTabViewModel.c0(List<tc4.e>) → tc4.e._a → y34.c → j30`。
+
+真正问题：**j30 (`com.bytedance.kmp.reading.model.j30`) 的 getter 命名混淆, 初版
+反推字段映射时把 series_id 和 first_vid 完全搞反了**：
+
+| 原代码 (错) | 真相 |
+|------------|------|
+| `series_id = j30.J()` | J() 返回 **ep1 biz_vid** (例: 7624374611039226905) |
+| `first_vid = j30.u()` | u() 返回 **真 series_id** (例: 7624372698860227646) |
+
+### 反推过程（保留作未来参考）
+
+1. 从 `videos/疯美人/session_manifest.jsonl` 确认 ground truth:
+   - series_id = `7624372698860227646`
+   - ep1 biz_vid = `7624374611039226905`
+2. 写 `scripts/rank_probe_sid.py`: 挂 c0, 按剧名过滤《疯美人》, dump 全部 40 个 getter +
+   所有 120 个非空 field 值，标记包含 ground truth sid 的位置
+3. 输出显示 `u()` / `x()` / field A / field p 这四处都返回 `7624372698860227646`
+4. 选 `x()` 作 series_id 主来源，`u()` 作 fallback 并检查等价
+5. `J()` 原以为是 sid，实际是 ep1 biz_vid，更正为 `first_vid` 来源
+
+### 修复代码位置
+
+- `scripts/rank_collect.py` 的 `JS_HOOK` 字段映射 (2026-04-20 commit)
+- 新增 `_sid_u` 辅助字段: Python 侧对比 `x() != u()` 时打印警告, 未来 App
+  重命名混淆时能第一时间发现
+
+### 验证结果
+
+修复后重采热播榜 + 漫剧榜（46 条 unique）：
+
+- **字段完整性**: series_id / name / total / first_vid / cover_url 全部 100% 非空
+- **series_id 合法性**: 46/46 全部是 19 位纯数字
+- **first_vid ≠ series_id**: 0 条冲突（之前 bug 会导致这两个字段数值相同）
+- **Ground truth 匹配**: 《疯美人》series_id = `7624372698860227646` ✓ 与本报告开头实测值一致
+- **无 `_sid_u` 不一致 warning**: x() 和 u() 在所有 46 条都等价
+
+### 辅助工具
+
+- `scripts/rank_probe_sid.py` — 保留. 未来 App 更新混淆名后, 改 `GROUND_TRUTH` 字典
+  （取一部当前已下载剧）再跑一次即可重新找回正确 getter。
+- `scripts/rank_vm_methods.py` — 辅助枚举新版本类的方法签名。
