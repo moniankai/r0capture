@@ -76,12 +76,14 @@ python scripts/verify_drama.py -n "开局一条蛇，无限进化" \
 # 跑批量（每部剧自动 spawn_nav + v5_lean + verify）
 python scripts/hongguo_batch_lean.py \
     --input .planning/rankings/dramas.json \
-    --max-total 100          # 只下总集数 ≤ 100 的剧
-    --max-dramas 10          # 本次限 10 部
+    --max-total 130          # 只下总集数 ≤ 100 的剧
+    --max-dramas   100        # 本次限 10 部
 
 # 断点续传: .batch_state.json 自动记录, 重跑 skip 已 done
 # 失败策略: 默认 skip 继续, --halt-on-fatal 遇错即停
 # 设备自愈: --reboot-every 5 每 5 部 reboot 手机
+
+python scripts/hongguo_batch_lean.py --input .planning/rankings/dramas.json --max-total 130 --max-dramas 100
 ```
 
 ### 流程 C：只下某一集 / 集数段
@@ -97,18 +99,136 @@ python scripts/v5_lean.py -n "剧名" --series-id XXX -t 60 -s 10 -e 20
 
 ### 方式 1：排行榜批量采（推荐）
 
-开独立 session 按 `HANDOFF_METADATA.md` 操作，产出 `.planning/rankings/dramas.json`：
+**脚本**: `scripts/rank_collect.py`（2026-04-20 实装, Compose 榜单页 `SeriesRankTabViewModel.c0(List)` hook）
+
+#### 前置条件
+
+| 项 | 要求 |
+|---|------|
+| ADB 连通 | `adb devices` 看到 `device` 状态 |
+| App 在运行 | `adb shell pidof com.phoenix.read` 非空 |
+| frida-server 运行 | `adb shell "su -c 'pidof frida-server'"` 非空 |
+| Frida 16.5.9 | PC + 手机 frida-server 版本一致 |
+| App 已登录 | 任意前台页均可, 排行榜需登录态 |
+| 屏幕分辨率 | 1080x1920 (坐标按此硬编码) |
+
+#### 运行命令
+
+```bash
+# 默认榜: 热播榜 + 漫剧榜
+python scripts/rank_collect.py --serial 4d53df1f --ranks "热播榜,漫剧榜"
+
+# 自定义榜 + 小剂量试采
+python scripts/rank_collect.py --serial 4d53df1f --ranks "热播榜" \
+    --per-rank-limit 20 --max-swipes 5
+
+# 清旧产物干净重采
+rm -f .planning/rankings/dramas.json .planning/rankings/snapshots.jsonl
+python scripts/rank_collect.py --serial 4d53df1f --ranks "热播榜,漫剧榜" --max-swipes 15
+
+# 后台跑 (Windows Git Bash 管道会吞 buffered 输出, 必须 -u)
+python -u scripts/rank_collect.py --serial 4d53df1f ... > d:/tmp/collect.log 2>&1 &
+```
+
+**CLI 参数**:
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--serial` | `$ADB_SERIAL` | ADB 设备序列号 |
+| `--ranks` | `热播榜,漫剧榜` | 榜单列表, 逗号分隔 |
+| `--per-rank-limit` | `0` (不限) | 每榜采到 N 条就停 |
+| `--max-swipes` | `40` | 单榜最大下滑次数 (安全上限) |
+
+**首版支持的榜** (首屏可见 5 个): 预约榜 / 推荐榜 / 热播榜 / 漫剧榜 / 新剧榜
+（演员榜 / 必看榜 / 收藏榜 / 热搜榜需横滑才可见, 首版未支持）
+
+
+# 1. 命令行参数 (最常用)
+python scripts/rank_collect.py --serial 4d53df1f --ranks "热播榜,漫剧榜"
+
+# 2. 环境变量
+export ADB_SERIAL=4d53df1f      # Linux/Mac/Git Bash
+set ADB_SERIAL=4d53df1f         # Windows cmd
+python scripts/rank_collect.py --ranks "热播榜,漫剧榜"
+
+# 3. 不传 (只连了一台设备时)
+python scripts/rank_collect.py --ranks "热播榜,漫剧榜"
+# 脚本会自动执行 adb devices 取第一台
+
+脚本现支持全部 9 个榜
+榜名	tap x	前置横滑次数
+预约榜 / 推荐榜 / 热播榜 / 漫剧榜 / 新剧榜	120 / 324 / 528 / 732 / 936	0
+演员榜 / 必看榜 / 收藏榜	390 / 594 / 798	1
+热搜榜	960	2
+
+#### 脚本内部流程
+
+```
+每个榜循环执行:
+  1. force_reenter: BACK 到主页 → tap 剧场 (324,1820) → tap 排行榜 (442,381)
+     (确保列表回到顶部 + tab bar 在 y=516 可见)
+  2. sleep 1.5s + drain 队列残留 (推荐榜进入时的 stale c0 事件)
+  3. tap_rank_tab(当前榜, y=516)
+  4. sleep 2.5s 等 Compose 首屏数据到达
+  5. drain() 采首屏 (通常 10 条)
+  6. 循环 swipe 下滚 (540,1550→540,900, 700ms) + drain, 直到:
+     - 连续 3 次无新 series_id, 或
+     - 达到 --max-swipes 上限, 或
+     - 达到 --per-rank-limit 条目数
+  7. atomic save dramas.json
+```
+
+#### 产物
+
+```
+.planning/rankings/dramas.json       主档 (series_id 为 key, 覆盖写)
+.planning/rankings/snapshots.jsonl   历史快照 (append-only, 每榜 snapshot)
+```
+
+**dramas.json 示例条目**:
 ```json
 {
   "7622955207885851672": {
     "series_id": "7622955207885851672",
     "name": "开局一条蛇，无限进化",
     "total": 83,
-    "first_vid": "...",
-    "source_ranks": ["热播榜/1", "完结榜/5"]
+    "first_vid": "7622955207885851xxx",
+    "cover_url": "https://p3-reading-sign.fqnovelpic.com/...",
+    "recommend_text": "玄幻 / 修仙·全83集",
+    "top_comment": "...",
+    "popularity": 27731250,
+    "source_ranks": ["热播榜/1", "漫剧榜/5"],
+    "first_seen_at": "2026-04-20T17:10:01",
+    "last_updated_at": "2026-04-20T17:10:04"
   }
 }
 ```
+
+字段合并规则: `source_ranks` UNION, 其他空值不覆盖; `first_seen_at` 首次永不改。
+
+#### 故障恢复
+
+| 症状 | 处理 |
+|------|------|
+| `frida.TransportError: timeout` | `taskkill /F /IM python.exe` + 重启 frida-server |
+| ANR 对话框弹出 | `adb shell am force-stop com.phoenix.read` + 重启 App + 重启 frida-server |
+| "未进入排行榜页" | 脚本已 3 次重试, 还失败则 screencap 检查是否有弹窗 / 键盘遮挡 |
+| 某榜采到 0 条 | 上次采集可能滚到底 tab bar 被遮挡, 已用 `force_reenter` 每榜修复 |
+| `hook ready 超时` | App 正在启动中, 等 10s 稳定后重试 |
+
+#### 已知局限
+
+- **漫剧榜实际只有 ~10 条**, 之后 App fallback 显示热播榜推荐, 标记为"漫剧榜/11+"
+- **横滑才露出的榜暂不支持**: 演员榜 / 必看榜 / 收藏榜 / 热搜榜
+- **`is_locked` / `unlocked_eps` 字段留 null**, P3 再补
+- **rank_pos 用 Python 首见顺序**（服务端 `v()` 里的 rank 只是 batch 内 1-10）
+
+#### 详细文档
+
+- 详细字段映射 / hook 原理 / 故障排查: `.planning/rankings/P1_采集器操作指南.md`
+- UI 坐标探测过程: `.planning/rankings/P0_探测结果.md`
+- Bug 反推记录: `.planning/rankings/METADATA_BUG_REPORT.md`
+- Schema 约定: `HANDOFF_METADATA.md`
 
 ### 方式 2：交互式单部采集
 
